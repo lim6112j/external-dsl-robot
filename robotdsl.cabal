@@ -1,0 +1,100 @@
+cabal-version:      2.4
+name:               robotdsl
+version:            0.1.0.0
+synopsis:           External text DSL that compiles to VDA 5050 v3.0.0 messages
+description:         robotdsl is an external domain-specific language for writing
+                    mobile-robot missions as plain text, and a compiler that lowers
+                    them to wire-ready VDA 5050 v3.0.0 JSON.
+                    .
+                    Operators describe @order@, @instantActions@ and @zoneSet@
+                    messages in a small brace-delimited language. The compiler
+                    fills in the standard's mandatory bookkeeping (headerId,
+                    timestamp, sequenceId numbering, actionId uniqueness,
+                    context-correct blockingType defaults) and validates the
+                    result against the official v3.0.0 JSON Schemas.
+                    .
+                    Target standard: VDA 5050 v3.0.0 (including zones).
+license:            BSD-3-Clause
+license-file:       LICENSE
+author:             robotdsl contributors
+maintainer:         robotdsl@example.invalid
+category:           Language, Robotics
+build-type:         Simple
+extra-source-files: README.md
+                    schemas/vda5050/3.0.0/*.schema
+                    examples/*.robot
+
+source-repository head
+    type:     git
+    location: https://example.invalid/robotdsl.git
+
+common warnings
+    ghc-options: -Wall -Wunused-imports -Wunused-local-binds -Wmissing-signatures
+
+library
+    import:           warnings
+    exposed-modules:  RobotDSL.AST
+                      RobotDSL.Emit
+                      RobotDSL.Parser
+                      RobotDSL.Schema
+                      RobotDSL.Validate
+                      RobotDSL.Version
+    hs-source-dirs:   src
+    default-language: Haskell2010
+    build-depends:    base              >=4.20 && <5
+                    , aeson             >=2.2  && <2.3
+                    , bytestring        >=0.11 && <0.13
+                    , containers        >=0.6  && <0.8
+                    , directory         >=1.3  && <1.4
+                    , exceptions        >=0.10 && <0.11
+                    , filepath          >=1.4  && <1.6
+                    , megaparsec        >=9.5  && <9.8
+                    , mtl               >=2.3  && <2.4
+                    , scientific         >=0.3  && <0.4
+                    , text              >=2.0  && <2.2
+                    , time              >=1.12 && <1.15
+                    , vector            >=0.13 && <0.14
+
+executable robotdsl
+    import:           warnings
+    main-is:          Main.hs
+    hs-source-dirs:   app
+    default-language: Haskell2010
+    build-depends:    base
+                    , robotdsl
+                    , aeson
+                    , bytestring
+                    , containers
+                    , directory
+                    , filepath
+                    , megaparsec
+                    , text
+                    , time
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N"
+
+test-suite robotdsl-test
+    import:           warnings
+    -- Tests reach for `head` on lists they assert are non-empty immediately
+    -- afterwards; that is idiomatic here, so the partiality warning is noise.
+    ghc-options:      -Wno-x-partial
+    type:             exitcode-stdio-1.0
+    main-is:          Spec.hs
+    other-modules:    ParserSpec
+                    , EmitSpec
+                    , SchemaSpec
+    hs-source-dirs:   test
+    default-language: Haskell2010
+    build-depends:    base
+                    , robotdsl
+                    , aeson
+                    , bytestring
+                    , containers
+                    , directory
+                    , filepath
+                    , megaparsec
+                    , scientific         >=0.3  && <0.4
+                    , tasty            >=1.5  && <1.6
+                    , tasty-hunit      >=0.10 && <0.11
+                    , text
+                    , time
+                    , vector            >=0.13 && <0.14

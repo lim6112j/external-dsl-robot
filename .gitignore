@@ -1,0 +1,12 @@
+dist
+dist-newstyle
+*.o
+*.hi
+*.dyn_o
+*.dyn_hi
+.hpc
+cabal.project.local
+cabal.project.local~
+.HTF/
+.stack-work/
+out/

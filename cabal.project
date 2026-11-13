@@ -1,0 +1,5 @@
+packages: .
+
+-- Development builds: -O0 keeps the edit/compile/test loop fast. Bump to 1
+-- for a release build.
+optimization: 0
