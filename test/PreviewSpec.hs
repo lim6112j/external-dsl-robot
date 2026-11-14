@@ -55,6 +55,28 @@ previewTests =
           assertBool "hop reported"
             (any (T.isInfixOf "no edge from AS-3M to CHG-01") (pvUnplaced pv))
 
+  , testCase "a rejected hop names what the node does reach" $ do
+      -- 이웃 정보가 함께 가야 생성기가 중간 노드를 채울 수 있다.
+      -- 이 문장은 생성 루프가 모델에 되돌리는 그 문장이다.
+      let voc = previewVocab
+                   { vocEdgePairs = [("RK-AW", "AS-3M"), ("AS-3M", "AS-2M")] }
+      case previewSource voc previewDsl of
+        Left errs -> assertFailure (unlines errs)
+        Right pv ->
+          assertBool "the reachable neighbours are named"
+            (any (T.isInfixOf "from AS-3M the map connects only to AS-2M")
+                 (pvUnplaced pv))
+
+  , testCase "a node with no outgoing edge is said to have none" $ do
+      -- 이웃이 없으면 목록이 비어 문장이 깨지므로 별도의 문구를 쓴다.
+      let voc = previewVocab { vocEdgePairs = [("CHG-01", "RK-AW")] }
+      case previewSource voc previewDsl of
+        Left errs -> assertFailure (unlines errs)
+        Right pv ->
+          assertBool "no dangling comma"
+            (any (T.isInfixOf "has no outgoing edge on this map at all")
+                 (pvUnplaced pv))
+
   , testCase "a map with no edges reports no hops at all" $ do
       -- Otherwise every hop would be flagged and bury the real problem.
       let voc = previewVocab { vocEdgePairs = [] }

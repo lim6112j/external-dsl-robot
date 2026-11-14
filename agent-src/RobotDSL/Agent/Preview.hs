@@ -112,12 +112,33 @@ unplacedNode voc nid
 -- When the map carries no edges at all there is nothing to check against, and
 -- reporting every hop would bury the real problem, so that case is skipped. A
 -- hop touching an unknown node is already covered by 'unplacedNode'.
+--
+-- The message names what @a@ does reach, because a route the map cannot carry
+-- is usually a route with the intermediate nodes left out: "RK-AM to CONV-OUT"
+-- is not a hop the map knows, but RK-AM reaches RK-AE and RK-AW. This is the
+-- same sentence the generation loop feeds back to the model, so the operator
+-- and the generator are told the same thing and cannot drift apart.
 unplacedHop :: Vocabulary -> (Text, Text) -> [Text]
 unplacedHop voc (a, b)
   | null (vocEdgePairs voc) = []
   | a `notElem` vocNodes voc || b `notElem` vocNodes voc = []
   | (a, b) `elem` vocEdgePairs voc = []
-  | otherwise = ["there is no edge from " <> a <> " to " <> b]
+  | otherwise =
+      [ "there is no edge from " <> a <> " to " <> b
+          <> neighbourHint voc a
+      ]
+
+-- | What a node reaches in one hop, phrased for a hop that was rejected.
+neighbourHint :: Vocabulary -> Text -> Text
+neighbourHint voc a = case neighboursOf voc a of
+  [] -> "; " <> a <> " has no outgoing edge on this map at all"
+  ns -> "; from " <> a <> " the map connects only to "
+          <> T.intercalate ", " ns
+          <> ", so travel through those nodes"
+
+-- | The nodes reachable from one node in a single hop.
+neighboursOf :: Vocabulary -> Text -> [Text]
+neighboursOf voc a = [b | (x, b) <- vocEdgePairs voc, x == a]
 
 -- ---------------------------------------------------------------------------
 -- Warnings

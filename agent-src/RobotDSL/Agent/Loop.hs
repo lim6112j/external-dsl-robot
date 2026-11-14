@@ -22,6 +22,7 @@ module RobotDSL.Agent.Loop
   , LoopConfig(..)
   , runLoop
   , finalize
+  , mapRejects
   , inject
   ) where
 
@@ -35,6 +36,7 @@ import Network.HTTP.Client (Manager)
 import RobotDSL.Agent.Client
 import RobotDSL.Agent.Context (Vocabulary)
 import RobotDSL.Agent.Fleet (RobotRef(..))
+import RobotDSL.Agent.Preview (previewSource, Preview(..))
 import RobotDSL.Agent.Prompt
 import RobotDSL.AST
 import RobotDSL.Emit
@@ -111,13 +113,23 @@ runLoop cfg history request = do
         Right comp -> do
           modifyIORef' usageRef
             (\(p, c) -> (p + compPromptTokens comp, c + compCompletionTokens comp))
-          let dsl = cleanOutput (compText comp)
-          case finalize cfg dsl of
-            Right msgs -> finish usageRef attempt [] dsl (Just msgs)
-            Left problems ->
-              if attempt >= lrMaxAttempts
-                then finish usageRef attempt problems dsl Nothing
-                else go usageRef (attempt + 1) problems
+          let dsl     = cleanOutput (compText comp)
+              rejects = mapRejects (lcVocab cfg) dsl
+              -- A route the map cannot carry is valid DSL that cannot be
+              -- driven, so it is retried exactly like a parse failure. The
+              -- operator keeps the last source either way: lrDsl is what they
+              -- edit by hand when the loop runs out of attempts.
+              retry problems =
+                if attempt >= lrMaxAttempts
+                  then finish usageRef attempt problems dsl Nothing
+                  else go usageRef (attempt + 1) problems
+          case (finalize cfg dsl, rejects) of
+            (Right msgs, []) -> finish usageRef attempt [] dsl (Just msgs)
+            -- The map reasons ride along with the DSL-level ones, so a
+            -- source that is both invalid and unroutable is reported in one
+            -- go rather than one reason per attempt.
+            (Right _, rs) -> retry rs
+            (Left problems, _) -> retry problems
 
 finish :: IORef (Int, Int) -> Int -> [Text] -> Text -> Maybe [Value] -> IO LoopResult
 finish usageRef attempt errs dsl msgsM = do
@@ -141,6 +153,30 @@ feedbackText errs = T.intercalate "\n\n"
   , ""
   , T.intercalate "\n" (map (\e -> "- " <> e) errs)
   ]
+
+-- | Reasons the map cannot carry the route this source describes.
+--
+-- "RobotDSL.Validate" knows nothing about maps, so a route through two nodes
+-- the map does not connect is valid DSL: it parses, it validates, it emits.
+-- It just cannot be driven. Observed in practice: asked to take a pallet to
+-- conveyor A, the generator produced @RK-AM -> CONV-OUT@ in one hop, and both
+-- nodes are real — but the map connects RK-AM only to RK-AE and RK-AW, so the
+-- real route is six hops through AS-1E, AS-2E, AS-3E, AS-4E. Nothing caught
+-- it, because the only check lived in the preview, which is read-only.
+--
+-- Deliberately not folded into 'finalize': that is also what gates a manual
+-- save, and an operator drafting a mission should still be able to write it
+-- down even while the map cannot yet carry it. This is the generation loop's
+-- own gate, so the model gets a second attempt with the reasons the operator
+-- would have been shown.
+--
+-- The reasons are the preview's, so the model is told exactly what the
+-- operator sees. A source that does not parse is already rejected by the
+-- parser with a better message, so it is not rejected twice here.
+mapRejects :: Vocabulary -> Text -> [Text]
+mapRejects voc src = case previewSource voc src of
+  Left _    -> []
+  Right pv  -> pvUnplaced pv
 
 -- | Parse, validate, inject and emit.
 --

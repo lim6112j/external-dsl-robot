@@ -151,6 +151,35 @@ tests = pure
           -- 스텁은 요청을 최신순으로 쌓으므로 head 가 두 번째 호출이다.
           assertBool "second call carries the rejection"
                      (T.isInfixOf "rejected" (messagesText (head calls)))
+      , testCase "retries a route the map cannot carry" $ withStub attemptOkOnThird $ \st -> do
+          -- 맵이 못 나르는 홉을 내면 재시도하여 두 번째에서 성공해야 한다.
+          -- 이 검사가 없으면 생성기는 유효하지만 주행 불가한 임무를
+          -- 성공으로 돌려보낸다.
+          r <- runLoop (loopCfg st) [] "랙에서 컨베이어로"
+          assertOk r
+          assertEqual "two attempts" 2 (lrAttempts r)
+          calls <- readIORef (stubCalls st)
+          assertEqual "two calls" 2 (length calls)
+          -- 스텁은 요청을 최신순으로 쌓으므로 head 가 두 번째 호출이다.
+          assertBool "the rejection names the unreachable hop"
+                     (T.isInfixOf "there is no edge from RK-AM to STG-01"
+                                 (messagesText (head calls)))
+          -- 이웃 정보가 함께 가야 재시도가 산 길을 찾을 수 있다.
+          assertBool "the rejection names what RK-AM does reach"
+                     (T.isInfixOf "from RK-AM the map connects only to CHG-01"
+                                 (messagesText (head calls)))
+
+      , testCase "gives up when the route stays undrivable" $
+          withStub (const badRouteDsl) $ \st -> do
+            r <- runLoop (loopCfg st) [] "랙에서 컨베이어로"
+            assertNotOk r
+            assertEqual "three attempts" 3 (lrAttempts r)
+            assertBool "the failure is the unroutable hop"
+                       (any (T.isInfixOf "there is no edge from RK-AM to STG-01")
+                            (lrErrors r))
+            -- 실패해도 마지막 소스는 남겨두어 운영자가 손으로 고칠 수 있다.
+            assertBool "the last source is kept" (not (T.null (lrDsl r)))
+
       , testCase "injects the robot declaration the model omitted" $ withStub (const noRobotDsl) $ \st -> do
           r <- runLoop (loopCfg st) [] "멈춰"
           assertOk r
@@ -332,6 +361,30 @@ attemptOkOnSecond :: Int -> Text
 attemptOkOnSecond 1 = garbage
 attemptOkOnSecond _ = goodDsl
 
+-- | A route through two nodes the map does not connect.
+--
+-- Both node ids are real, so the parser and the validator accept this and it
+-- emits a well-formed order. It just cannot be driven: the fixture map joins
+-- RK-AM to CHG-01 and CHG-01 to STG-01, so RK-AM never reaches STG-01 in one
+-- hop. This is the shape the generator actually produced when asked to take a
+-- pallet to the conveyor — it picked two real nodes and joined them.
+badRouteDsl :: Text
+badRouteDsl = T.unlines
+  [ "robot \"acme\" \"AMR-001\""
+  , "map \"plant-b\""
+  , "order \"order-pallet-1\" {"
+  , "  base {"
+  , "    node \"RK-AM\" at (12.5, 3.0) { action \"pick\" }"
+  , "    go to \"STG-01\" at (0.0, 0.0) { action \"drop\" }"
+  , "  }"
+  , "}"
+  ]
+
+-- | First proposes the unroutable hop, then corrects it.
+attemptOkOnThird :: Int -> Text
+attemptOkOnThird 1 = badRouteDsl
+attemptOkOnThird _ = goodDsl
+
 fence :: Text -> Text -> Text
 fence lang body = "```" <> lang <> "\n" <> body <> "```\n"
 
@@ -441,9 +494,10 @@ loopCfg :: Stub -> LoopConfig
 loopCfg st = LoopConfig
   { lcManager = stubMgr st
   , lcClient  = stubCfg st
-  , lcVocab   = Vocabulary (Just "plant-b") ["RK-AM", "CHG-01"] []
-                              [("RK-AM", "CHG-01")] Nothing
-                              [("RK-AM", (1.0, 2.0)), ("CHG-01", (3.0, 4.0))]
+  , lcVocab   = Vocabulary (Just "plant-b") ["RK-AM", "CHG-01", "STG-01"] []
+                              [("RK-AM", "CHG-01"), ("CHG-01", "STG-01")] Nothing
+                              [ ("RK-AM", (1.0, 2.0)), ("CHG-01", (3.0, 4.0))
+                              , ("STG-01", (5.0, 6.0)) ]
   , lcEmit    = EmitContext "acme" "AMR-001" 1 "2026-01-01T00:00:00.000Z"
                            protocolVersion (Just "plant-b")
   , lcRobot   = Nothing
