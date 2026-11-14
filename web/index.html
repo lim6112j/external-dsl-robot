@@ -17,6 +17,22 @@
 </header>
 
 <main>
+  <section class="panel map-panel">
+    <h2>맵 <span class="hint" id="map-hint">노드를 클릭하면 이번 임무의 구역으로 제한합니다</span></h2>
+    <div id="map-wrap">
+      <svg id="map" role="img" aria-label="plant map"></svg>
+      <p id="map-empty" class="empty hidden">맵이 없습니다. <code>--map</code> 또는 <code>--fleet</code> 로 맵을 주세요.</p>
+    </div>
+
+    <div class="scope-bar">
+      <span id="scope-label" class="scope-label">구역: 전체 맵</span>
+      <button id="scope-clear" class="ghost small" disabled>전체로 되돌리기</button>
+    </div>
+
+    <h2>로봇 <span class="hint">오프라인 로봇은 선택할 수 없습니다</span></h2>
+    <div id="robots" class="robots empty">플릿에 연결되지 않았습니다</div>
+  </section>
+
   <section class="panel">
     <h2>명령</h2>
     <div class="row">
@@ -43,6 +59,12 @@
   <section class="panel">
     <h2>미리보기 <span class="hint">컴파일된 VDA 5050 메시지</span></h2>
     <pre id="preview" class="preview empty">아직 없습니다</pre>
+
+    <h2>맵에서 찾지 못한 것</h2>
+    <pre id="unplaced" class="unplaced empty">없습니다</pre>
+
+    <h2>경고</h2>
+    <pre id="warnings" class="warnings empty">없습니다</pre>
 
     <h2>오류</h2>
     <pre id="errors" class="errors empty">없습니다</pre>

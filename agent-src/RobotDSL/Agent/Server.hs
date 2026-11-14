@@ -22,11 +22,12 @@ import qualified Data.Aeson.KeyMap as KM
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.List (isSuffixOf)
-import Data.Maybe (fromMaybe)
+import Data.List (find, isSuffixOf)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import qualified Data.Vector as V
 import System.Directory (doesFileExist)
 import System.Exit (ExitCode(..))
 import System.FilePath ((</>))
@@ -40,7 +41,9 @@ import Network.Wai (Application, Request, Response, ResponseReceived,
 
 import RobotDSL.Agent.Client
 import RobotDSL.Agent.Context
+import RobotDSL.Agent.Fleet
 import RobotDSL.Agent.Loop
+import RobotDSL.Agent.Preview
 import RobotDSL.Agent.Prompt
 import RobotDSL.Emit
 import RobotDSL.Version
@@ -54,6 +57,9 @@ data AppState = AppState
   -- ^ Connection manager, created once so TLS is not renegotiated per call.
   , asClient    :: !ClientConfig
   , asVocab     :: !Vocabulary
+  , asFleet     :: !(Maybe FleetConfig)
+  -- ^ How to reach the fleet-control gateway. 'Nothing' means the agent works
+  -- from @--map@ alone and reports no robots, rather than failing.
   , asEmitCtx   :: !EmitContext
   , asSessions  :: !(IORef [(Text, [ChatMessage])])
   -- ^ Conversation history per browser session, oldest first.
@@ -61,10 +67,10 @@ data AppState = AppState
   , asSttPath   :: !FilePath
   }
 
-newAppState :: Manager -> ClientConfig -> Vocabulary -> EmitContext -> FilePath
-            -> FilePath -> IO AppState
-newAppState mgr cli vocab emitCtx webDir sttPath =
-  AppState mgr cli vocab emitCtx <$> newIORef [] <*> pure webDir <*> pure sttPath
+newAppState :: Manager -> ClientConfig -> Vocabulary -> Maybe FleetConfig
+            -> EmitContext -> FilePath -> FilePath -> IO AppState
+newAppState mgr cli vocab fleet emitCtx webDir sttPath =
+  AppState mgr cli vocab fleet emitCtx <$> newIORef [] <*> pure webDir <*> pure sttPath
 
 app :: AppState -> Application
 app st req respond =
@@ -96,23 +102,55 @@ app st req respond =
 -- @sttReady@ is passed in rather than derived here because it needs an IO
 -- check, and reporting a helper as ready when it is not built would send the
 -- operator down a dead end.
+-- | The vocabulary, the fleet and the identity in use, so the UI can show the
+-- operator what the generator may name and which robot it would talk to.
+--
+-- The robot list is fetched here rather than cached: robots come and go while
+-- the agent runs, and a picker offering one that just went offline is worse
+-- than an extra local GET per page load. A gateway that cannot be reached is
+-- reported as a reason instead of an error, because the operator can still
+-- type a command — the DSL will simply name the robot itself.
 handleContext :: AppState -> Respond -> IO ResponseReceived
 handleContext st respond = do
   ready <- doesFileExist (asSttPath st)
-  json respond status200 (contextValue st ready)
+  robots <- case asFleet st of
+    Nothing -> pure (Right [])
+    Just fc -> fetchRobots (asManager st) fc
+  json respond status200 (contextValue st ready robots)
 
-contextValue :: AppState -> Bool -> Value
-contextValue st sttReady = object
+contextValue :: AppState -> Bool -> Either String [RobotRef] -> Value
+contextValue st sttReady robots = object
   [ "mapId"        .= vocMapId (asVocab st)
-  , "nodes"        .= vocNodes (asVocab st)
-  , "edges"        .= vocEdges (asVocab st)
+  , "nodes"        .= map mapNodeValue (vocPositions (asVocab st))
+  , "nodeIds"      .= vocNodes (asVocab st)
+  , "edges"        .= map mapEdgeValue (vocEdgePairs (asVocab st))
   , "actions"      .= standardActions
+  , "robots"       .= map robotValue (either (const []) id robots)
+  , "fleetError"   .= either Just (const Nothing) robots
   , "model"        .= ccModel (asClient st)
   , "manufacturer" .= ecManufacturer (asEmitCtx st)
   , "serialNumber" .= ecSerialNumber (asEmitCtx st)
   , "version"      .= protocolVersionText (ecVersion (asEmitCtx st))
   , "hasMap"       .= not (null (vocNodes (asVocab st)))
   , "sttReady"     .= sttReady
+  ]
+
+-- | A node the browser can place: id plus coordinates, when the map names them.
+mapNodeValue :: (Text, (Double, Double)) -> Value
+mapNodeValue (nid, (x, y)) = object ["id" .= nid, "x" .= x, "y" .= y]
+
+-- | An edge the browser can draw, as the pair of nodes it connects.
+mapEdgeValue :: (Text, Text) -> Value
+mapEdgeValue (a, b) = object ["from" .= a, "to" .= b]
+
+robotValue :: RobotRef -> Value
+robotValue r = object
+  [ "robotId"      .= rrRobotId r
+  , "manufacturer" .= rrManufacturer r
+  , "serialNumber" .= rrSerialNumber r
+  , "online"       .= rrOnline r
+  , "driving"      .= rrDriving r
+  , "orderId"      .= rrOrderId r
   ]
 
 handleCommand :: AppState -> Request -> Respond -> IO ResponseReceived
@@ -125,8 +163,13 @@ handleCommand st req respond = do
       Nothing -> json respond status400 (failValue "the request has no text field")
       Just txt -> do
         let sid = fromMaybe "default" (field "sessionId" v)
+            -- A scope the operator picked narrows the generator's vocabulary.
+            -- The preview still checks against the whole map, so a mission
+            -- that strays outside the scope stays visible.
+            vocab = applyScope (fieldList "scope" v) (asVocab st)
+        robot <- resolveRobot st (field "robotId" v)
         history <- lookupSession st sid
-        res <- runLoop (loopConfig st) history txt
+        res <- runLoop (loopConfigWith st vocab robot) history txt
         if not (lrOk res)
           then json respond status200 (object
             [ "ok"       .= False
@@ -145,6 +188,7 @@ handleCommand st req respond = do
               , "messages" .= lrMessages res
               , "attempts" .= lrAttempts res
               , "usage"    .= lrUsage res
+              , "preview"  .= previewValue (asVocab st) (lrDsl res)
               ])
 
 handleCompile :: AppState -> Request -> Respond -> IO ResponseReceived
@@ -163,6 +207,7 @@ handleCompile st req respond = do
         Right msgs -> json respond status200 (object
           [ "ok"       .= True
           , "messages" .= msgs
+          , "preview"  .= previewValue (asVocab st) dsl
           ])
 
 handleSave :: AppState -> Request -> Respond -> IO ResponseReceived
@@ -287,11 +332,20 @@ capTurns msgs
 -- ---------------------------------------------------------------------------
 
 loopConfig :: AppState -> LoopConfig
-loopConfig st = LoopConfig
+loopConfig st = loopConfigWith st (asVocab st) Nothing
+
+-- | The loop configuration for one request.
+--
+-- @vocab@ is the vocabulary the generator may draw on — the whole map, or the
+-- operator's scoped subset — and @robot@ is the one the operator picked. Paths
+-- that know neither, such as a manual recompile or a save, use 'loopConfig'.
+loopConfigWith :: AppState -> Vocabulary -> Maybe RobotRef -> LoopConfig
+loopConfigWith st vocab robot = LoopConfig
   { lcManager = asManager st
   , lcClient  = asClient st
-  , lcVocab   = asVocab st
+  , lcVocab   = vocab
   , lcEmit    = asEmitCtx st
+  , lcRobot   = robot
   , lcMfr     = Just (ecManufacturer (asEmitCtx st))
   , lcSerial  = Just (ecSerialNumber (asEmitCtx st))
   }
@@ -301,6 +355,71 @@ field k (Object o) = case KM.lookup (Key.fromText k) o of
   Just (String s) -> Just s
   _               -> Nothing
 field _ _ = Nothing
+
+-- | A list of strings from a JSON array field.
+fieldList :: Text -> Value -> Maybe [Text]
+fieldList k (Object o) = case KM.lookup (Key.fromText k) o of
+  Just (Array a) -> Just (mapMaybe asText (V.toList a))
+  _              -> Nothing
+fieldList _ _ = Nothing
+
+asText :: Value -> Maybe Text
+asText (String s) = Just s
+asText _          = Nothing
+
+-- | The robot the operator picked, resolved against the gateway.
+--
+-- Returns 'Nothing' when no fleet is configured, when the request names no
+-- robot, or when the gateway cannot be reached. In each of those cases the
+-- generator falls back to naming the robot itself: a worse answer, but not a
+-- wrong one, and a dead gateway must not stop the operator asking for a
+-- mission.
+resolveRobot :: AppState -> Maybe Text -> IO (Maybe RobotRef)
+resolveRobot _ Nothing = pure Nothing
+resolveRobot st (Just want) = case asFleet st of
+  Nothing -> pure Nothing
+  Just fc -> do
+    r <- fetchRobots (asManager st) fc
+    pure $ case r of
+      Left _   -> Nothing
+      Right rs -> find ((== want) . rrRobotId) rs
+
+-- | The route laid out on the map, so the browser can draw it.
+--
+-- Re-parsing looks wasteful, but the loop returns emitted JSON rather than the
+-- AST, and a source that already validated through the loop cannot fail here in
+-- a way the operator would notice. Threading the AST through 'LoopResult' would
+-- couple the loop to the preview for no gain.
+previewValue :: Vocabulary -> Text -> Value
+previewValue vocab dsl = case previewSource vocab dsl of
+  Left errs -> previewFields [] [] [] (map T.pack errs) []
+  Right pv  -> previewFields
+    (map previewNodeValue (pvNodes pv))
+    (map previewHopValue (pvHops pv))
+    (pvReleased pv)
+    (pvUnplaced pv)
+    (pvWarnings pv)
+
+previewFields :: [Value] -> [Value] -> [Bool] -> [Text] -> [Text] -> Value
+previewFields ns hs rel un wns = object
+  [ "nodes"    .= ns
+  , "hops"     .= hs
+  , "released" .= rel
+  , "unplaced" .= un
+  , "warnings" .= wns
+  ]
+
+-- | A node in the preview. Coordinates are absent exactly when the map does
+-- not name the node, which is when the operator needs to see it.
+previewNodeValue :: (Text, Maybe (Double, Double)) -> Value
+previewNodeValue (nid, mp) = object
+  [ "id" .= nid
+  , "x"  .= fmap fst mp
+  , "y"  .= fmap snd mp
+  ]
+
+previewHopValue :: (Text, Text) -> Value
+previewHopValue (a, b) = object ["from" .= a, "to" .= b]
 
 -- | Reject anything that is not a plain relative file name: no absolute paths,
 -- no @..@ traversal, no home expansion.

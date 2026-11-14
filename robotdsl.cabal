@@ -83,7 +83,9 @@ library agent
     visibility:       private
     exposed-modules:  RobotDSL.Agent.Client
                       RobotDSL.Agent.Context
+                      RobotDSL.Agent.Fleet
                       RobotDSL.Agent.Loop
+                      RobotDSL.Agent.Preview
                       RobotDSL.Agent.Prompt
                       RobotDSL.Agent.Server
     hs-source-dirs:   agent-src
@@ -146,6 +148,8 @@ test-suite robotdsl-test
                     , EmitSpec
                     , SchemaSpec
                     , AgentSpec
+                    , FleetSpec
+                    , PreviewSpec
     hs-source-dirs:   test
     default-language: Haskell2010
     build-depends:    base

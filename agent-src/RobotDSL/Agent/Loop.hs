@@ -34,6 +34,7 @@ import Network.HTTP.Client (Manager)
 
 import RobotDSL.Agent.Client
 import RobotDSL.Agent.Context (Vocabulary)
+import RobotDSL.Agent.Fleet (RobotRef(..))
 import RobotDSL.Agent.Prompt
 import RobotDSL.AST
 import RobotDSL.Emit
@@ -58,6 +59,9 @@ data LoopConfig = LoopConfig
   , lcEmit     :: !EmitContext
   -- ^ manufacturer, serialNumber and mapId used both for injection and for
   -- emitting the preview JSON.
+  , lcRobot    :: !(Maybe RobotRef)
+  -- ^ The robot the mission is for, when the fleet is known. Feeds the prompt
+  -- only; injection still uses lcMfr and lcSerial.
   , lcMfr      :: !(Maybe Text)
   , lcSerial   :: !(Maybe Text)
   -- ^ Robot identity to inject when the generated source omits it.
@@ -93,7 +97,7 @@ runLoop cfg history request = do
     go usageRef attempt errs = do
       let feedback = [ChatMessage RoleUser (feedbackText errs) | not (null errs)]
           convo = history
-               ++ [ ChatMessage RoleSystem (systemPrompt (lcVocab cfg))
+               ++ [ ChatMessage RoleSystem (systemPrompt (lcRobot cfg) (lcVocab cfg))
                   , ChatMessage RoleUser (userMessage request)
                   ]
                ++ feedback

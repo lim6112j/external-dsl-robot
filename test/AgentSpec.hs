@@ -17,6 +17,7 @@ import qualified Data.Vector as V
 
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import System.Directory (doesFileExist, removeFile)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
@@ -26,12 +27,14 @@ import Network.HTTP.Client (Manager, defaultManagerSettings, httpLbs,
                             responseStatus)
 import Network.HTTP.Simple (setRequestBodyLBS, setRequestHeader,
                             setRequestMethod)
-import Network.HTTP.Types (hContentType, status200, statusCode)
-import Network.Wai (Application, lazyRequestBody, responseLBS)
+import Network.HTTP.Types (hContentType, status200, status404, statusCode)
+import Network.Wai (Application, lazyRequestBody, pathInfo, requestMethod,
+                    responseLBS)
 import Network.Wai.Handler.Warp (Port, testWithApplication)
 
 import RobotDSL.Agent.Client
 import RobotDSL.Agent.Context
+import RobotDSL.Agent.Fleet (FleetConfig(..), RobotRef(..))
 import RobotDSL.Agent.Loop
 import RobotDSL.Agent.Prompt
 import RobotDSL.Agent.Server
@@ -43,18 +46,43 @@ tests = pure
   [ testGroup "prompt"
       [ testCase "system prompt carries the map vocabulary" $ do
           let vocab = Vocabulary (Just "plant-b") ["RK-AM", "CHG-01"] []
-              p = systemPrompt vocab
+                              [("RK-AM", "CHG-01")] Nothing
+                              [("RK-AM", (1.0, 2.0)), ("CHG-01", (3.0, 4.0))]
+              p = systemPrompt Nothing vocab
           assertBool "mapId present" (T.isInfixOf "plant-b" p)
           assertBool "node RK-AM present" (T.isInfixOf "RK-AM" p)
           assertBool "node CHG-01 present" (T.isInfixOf "CHG-01" p)
       , testCase "system prompt carries the action catalogue" $ do
-          let p = systemPrompt emptyVocabulary
+          let p = systemPrompt Nothing emptyVocabulary
           forM_ standardActions $ \a ->
             assertBool ("action missing: " <> T.unpack a) (T.isInfixOf a p)
       , testCase "system prompt names every zone type" $ do
-          let p = systemPrompt emptyVocabulary
+          let p = systemPrompt Nothing emptyVocabulary
           forM_ zoneTypes $ \z ->
             assertBool ("zone type missing: " <> T.unpack z) (T.isInfixOf z p)
+      , testCase "system prompt carries the traversable hops" $ do
+          let vocab = Vocabulary (Just "plant-b") ["RK-AW", "AS-3M"] []
+                         [("RK-AW", "AS-3M")] Nothing []
+              p = systemPrompt Nothing vocab
+          assertBool "hop RK-AW -> AS-3M present" (T.isInfixOf "RK-AW -> AS-3M" p)
+      , testCase "a scope narrows the prompt vocabulary" $ do
+          let full = Vocabulary (Just "plant-b") ["RK-AW", "AS-3M"] []
+                              [("RK-AW", "AS-3M")] Nothing []
+              vocab = applyScope (Just ["RK-AW"]) full
+              p = systemPrompt Nothing vocab
+          assertBool "scoped node kept" (T.isInfixOf "RK-AW" p)
+          assertBool "out-of-scope node dropped" (not (T.isInfixOf "AS-3M" p))
+          assertBool "scope is stated" (T.isInfixOf "scope:" p)
+          assertEqual "scope is recorded" (Just ["RK-AW"]) (vocScope vocab)
+          assertEqual "hop outside the scope is dropped" [] (vocEdgePairs vocab)
+      , testCase "the prompt names the selected robot" $ do
+          let robot = RobotRef "acme:AMR-001" "acme" "AMR-001" (Just "plant-b") True True "order-7"
+              sec = robotSection (Just robot)
+          assertBool "robotId present" (T.isInfixOf "acme:AMR-001" sec)
+          assertBool "serialNumber present" (T.isInfixOf "AMR-001" sec)
+          assertBool "state reported" (T.isInfixOf "driving order order-7" sec)
+          assertBool "an absent robot is stated plainly"
+              (T.isInfixOf "No robot is selected" (robotSection Nothing))
       , testCase "cleanOutput strips a language-tagged fence" $ do
           let src = T.unlines ["robot \"a\" \"b\"", "order \"o\" {"]
           assertEqual "fence stripped" src (cleanOutput (fence "robotdsl" src))
@@ -139,10 +167,16 @@ tests = pure
       ]
 
   , testGroup "server"
-      [ testCase "GET /api/context reports the vocabulary" $ withServer $ \port mgr -> do
+      [ testCase "GET /api/context reports the map with coordinates" $ withServer $ \port mgr -> do
           v <- getJson mgr (baseUrl port <> "/api/context")
           assertEqual "hasMap" (Just True) (boolField v "hasMap")
-          assertBool "nodes listed" (not (null (arrField v "nodes")))
+          assertEqual "two drawable nodes" 2 (length (arrField v "nodes"))
+          assertEqual "one edge pair" 1 (length (arrField v "edges"))
+          assertBool "node carries coordinates"
+                     (any (\o -> objLookup "x" o /= Nothing
+                               && objLookup "y" o /= Nothing)
+                          (arrField v "nodes"))
+          assertEqual "no fleet configured" 0 (length (arrField v "robots"))
       , testCase "POST /api/command returns generated DSL" $ withServer $ \port mgr -> do
           v <- postJson mgr (baseUrl port <> "/api/command")
                  (object ["text" .= ("랙에서 컨베이어로" :: Text)
@@ -150,6 +184,15 @@ tests = pure
           assertEqual "ok" (Just True) (boolField v "ok")
           assertBool "dsl present" (not (T.null (strField v "dsl")))
           assertBool "messages present" (not (null (arrField v "messages")))
+          -- 미리보기가 함께 와야 UI 가 경로를 그릴 수 있다.
+          case objLookup "preview" v of
+            Nothing -> assertFailure "no preview in the response"
+            Just pv -> do
+              assertEqual "two nodes on the route" 2 (length (arrField pv "nodes"))
+              assertEqual "one hop between them" 1 (length (arrField pv "hops"))
+              assertEqual "both released" [True, True] (boolsField pv "released")
+              assertEqual "nothing unplaced" 0 (length (arrField pv "unplaced"))
+              assertEqual "no warnings" 0 (length (arrField pv "warnings"))
       , testCase "POST /api/command rejects a body with no text" $ withServer $ \port mgr -> do
           v <- postJson mgr (baseUrl port <> "/api/command") (object [])
           assertEqual "not ok" (Just False) (boolField v "ok")
@@ -158,6 +201,10 @@ tests = pure
           v <- postJson mgr (baseUrl port <> "/api/compile") (object ["dsl" .= goodDsl])
           assertEqual "ok" (Just True) (boolField v "ok")
           assertBool "messages present" (not (null (arrField v "messages")))
+          case objLookup "preview" v of
+            Nothing -> assertFailure "no preview in the compile response"
+            Just pv ->
+              assertEqual "route is drawn again" 2 (length (arrField pv "nodes"))
       , testCase "POST /api/compile reports errors for bad DSL" $ withServer $ \port mgr -> do
           v <- postJson mgr (baseUrl port <> "/api/compile")
                  (object ["dsl" .= ("nonsense" :: Text)])
@@ -206,7 +253,38 @@ tests = pure
             --  order-pallet-1 이 나오기 때문.)
             assertBool "second call carries the earlier turn"
                        (messageCount (head calls) > messageCount (last calls))
-      , testCase "an unknown route is a 404" $ withServer $ \port mgr -> do
+      , testCase "the agent never writes to the fleet gateway" $
+        withServerAndGateway $ \port mgr _ seen -> do
+          -- 읽기는 허용된다: 맵과 로봇을 조회한다.
+          _ <- getJson mgr (baseUrl port <> "/api/context")
+          _ <- postJson mgr (baseUrl port <> "/api/command")
+                 (object ["text" .= ("랙에서 컨베이어로" :: Text)
+                         , "sessionId" .= ("np" :: Text)])
+          _ <- postJson mgr (baseUrl port <> "/api/compile")
+                 (object ["dsl" .= goodDsl])
+          reqs <- readIORef seen
+          let writes = [ e | e@(m, _) <- reqs, m /= "GET" ]
+          assertEqual "no write ever reached the gateway" [] writes
+          -- 읽기가 실제로 일어났는지도 확인한다. 위 단정이 우연히 비어서가
+          -- 아님을 보이기 위해.
+          -- 맵은 시작 시 한 번 읽히므로(또는 --map 으로 공급되므로), 이
+          -- 런타임 경로에서 게이트웨이에 묻는 것은 로봇 목록뿐이다.
+          assertBool "the robots were read"
+                     (any ((== "/api/robots") . snd) reqs)
+
+    , testCase "the picked robot reaches the generator" $
+        withServerAndGateway $ \port mgr stub _ -> do
+          _ <- postJson mgr (baseUrl port <> "/api/command")
+                 (object ["text" .= ("랙에서 컨베이어로" :: Text)
+                         , "sessionId" .= ("rp" :: Text)
+                         , "robotId" .= ("acme:AMR-001" :: Text)])
+          calls <- readIORef (stubCalls stub)
+          assertEqual "one call" 1 (length calls)
+          -- 스텁은 요청을 최신순으로 쌓는다.
+          assertBool "the prompt names the chosen robot"
+                     (T.isInfixOf "acme:AMR-001" (messagesText (head calls)))
+
+    , testCase "an unknown route is a 404" $ withServer $ \port mgr -> do
           code <- getRaw mgr (baseUrl port <> "/nope")
           assertEqual "404" 404 code
       ]
@@ -277,6 +355,14 @@ boolField :: Value -> Text -> Maybe Bool
 boolField v k = case objLookup k v of
   Just (Bool b) -> Just b
   _             -> Nothing
+
+-- | A JSON array of booleans, e.g. the preview's per-node @released@ flags.
+-- A non-boolean entry is dropped rather than defaulted, so a shape change
+-- shows up as a short list instead of a plausible-looking wrong one.
+boolsField :: Value -> Text -> [Bool]
+boolsField v k = case objLookup k v of
+  Just (Array a) -> [ b | Bool b <- V.toList a ]
+  _              -> []
 
 arrField :: Value -> Text -> [Value]
 arrField v k = case objLookup k v of
@@ -356,8 +442,11 @@ loopCfg st = LoopConfig
   { lcManager = stubMgr st
   , lcClient  = stubCfg st
   , lcVocab   = Vocabulary (Just "plant-b") ["RK-AM", "CHG-01"] []
+                              [("RK-AM", "CHG-01")] Nothing
+                              [("RK-AM", (1.0, 2.0)), ("CHG-01", (3.0, 4.0))]
   , lcEmit    = EmitContext "acme" "AMR-001" 1 "2026-01-01T00:00:00.000Z"
                            protocolVersion (Just "plant-b")
+  , lcRobot   = Nothing
   , lcMfr     = Just "acme"
   , lcSerial  = Just "AMR-001"
   }
@@ -373,15 +462,88 @@ withServer f = withStub (const goodDsl) $ \stub -> do
     \port -> f port (stubMgr stub)
 
 serverApp :: Manager -> ClientConfig -> IO Application
-serverApp mgr client = do
+serverApp = serverAppWith Nothing
+
+-- | As 'serverApp', but pointed at a gateway.
+--
+-- @fleet@ is @Nothing@ for every test that does not care, so the default
+-- stays "no gateway" rather than "some gateway".
+serverAppWith :: Maybe FleetConfig -> Manager -> ClientConfig -> IO Application
+serverAppWith fleet mgr client = do
   let vocab = Vocabulary (Just "plant-b") ["RK-AM", "CHG-01"] []
+                              [("RK-AM", "CHG-01")] Nothing
+                              [("RK-AM", (1.0, 2.0)), ("CHG-01", (3.0, 4.0))]
       emitCtx = EmitContext "acme" "AMR-001" 1 "2026-01-01T00:00:00.000Z"
                             protocolVersion (Just "plant-b")
-  st <- newAppState mgr client vocab emitCtx "web" ""
+  st <- newAppState mgr client vocab fleet emitCtx "web" ""
   pure (app st)
 
 baseUrl :: Port -> String
 baseUrl port = "http://127.0.0.1:" ++ show port
+
+-- | A stub of the fleet-control gateway that records every request it is
+-- given.
+--
+-- It answers the two reads the agent makes and nothing else, so a test can
+-- assert that no write ever arrived. This is the property that makes Phase 1
+-- safe: the agent can read the fleet, but it cannot move a robot.
+gatewayRecorder :: IORef [(String, String)] -> Application
+gatewayRecorder seen req respond =
+  case (requestMethod req, pathInfo req) of
+    ("GET", ["api", "map"]) -> do
+      atomicModifyIORef' seen (\c -> (("GET", "/api/map") : c, ()))
+      respond (responseLBS status200 [(hContentType, "application/json")]
+                 (encode gatewayMapJson))
+    ("GET", ["api", "robots"]) -> do
+      atomicModifyIORef' seen (\c -> (("GET", "/api/robots") : c, ()))
+      respond (responseLBS status200 [(hContentType, "application/json")]
+                 (encode gatewayRobotsJson))
+    _ -> do
+      let entry = ( T.unpack (TE.decodeUtf8 (requestMethod req))
+                  , T.unpack (T.intercalate "/" (pathInfo req)) )
+      atomicModifyIORef' seen (\c -> (entry : c, ()))
+      respond (responseLBS status404 [(hContentType, "text/plain")] "no")
+
+gatewayMapJson :: Value
+gatewayMapJson = object
+  [ "mapId" .= ("plant-b" :: Text)
+  , "nodes" .= object
+      [ "RK-AM" .= object ["x" .= (1.0 :: Double), "y" .= (2.0 :: Double)]
+      , "CHG-01" .= object ["x" .= (3.0 :: Double), "y" .= (4.0 :: Double)]
+      ]
+  , "edges" .= [ object ["from" .= ("RK-AM" :: Text), "to" .= ("CHG-01" :: Text)] ]
+  ]
+
+gatewayRobotsJson :: Value
+gatewayRobotsJson = object
+  [ "robots" .=
+    [ object
+        [ "robotId" .= ("acme:AMR-001" :: Text)
+        , "manufacturer" .= ("acme" :: Text)
+        , "serialNumber" .= ("AMR-001" :: Text)
+        , "connection" .= ("ONLINE" :: Text)
+        , "driving" .= False
+        , "orderId" .= ("" :: Text)
+        ]
+    ]
+  ]
+
+-- | The agent, wired to a stub model and a recording gateway.
+--
+-- Nesting the two warp instances is fine: each 'testWithApplication' takes its
+-- own ephemeral port. The gateway is only reachable from this test, so a write
+-- to it could not be anything but the agent's own doing.
+withServerAndGateway
+  :: (Port -> Manager -> Stub -> IORef [(String, String)] -> IO ()) -> IO ()
+withServerAndGateway f = withStub (const goodDsl) $ \stub -> do
+  seen <- newIORef []
+  testWithApplication (pure (gatewayRecorder seen)) $ \gwPort ->
+    testWithApplication
+      (serverAppWith
+         (Just (FleetConfig
+                  (T.pack ("http://127.0.0.1:" ++ show gwPort)) Nothing))
+         (stubMgr stub) (stubCfg stub))
+      $ \port -> f port (stubMgr stub) stub seen
 
 -- ---------------------------------------------------------------------------
 -- HTTP helpers

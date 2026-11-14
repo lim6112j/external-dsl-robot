@@ -144,3 +144,108 @@ button.ghost { background: transparent; }
 .errors { color: var(--err); }
 
 .empty { color: var(--muted); font-style: italic; }
+
+.hidden { display: none; }
+
+/* ---------------------------------------------------------------------------
+   Map
+   --------------------------------------------------------------------------- */
+
+/* The map is the one thing the operator must be able to read at a glance, so
+   it takes the full height of the left column. */
+.map-panel { grid-row: span 2; }
+
+#map-wrap { position: relative; }
+
+#map {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 58vh;
+  background: #fbfcfd;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+#map-empty { margin: 0; padding: 28px 12px; text-align: center; }
+
+/* Everything inside the SVG is drawn in map units — metres — so the stroke
+   widths and font sizes are small numbers, not pixels. */
+#map .edge { stroke: #c9cfd8; stroke-width: 0.22; }
+
+#map .node {
+  fill: #fff;
+  stroke: #8a93a3;
+  stroke-width: 0.2;
+  cursor: pointer;
+}
+#map .node:hover { stroke: var(--accent); stroke-width: 0.4; }
+#map .node.scoped { fill: #dbeafe; stroke: var(--accent); stroke-width: 0.4; }
+#map .node.used { fill: var(--accent); stroke: #1e40af; stroke-width: 0.4; }
+
+#map .node-label {
+  fill: var(--muted);
+  font-size: 1.15px;
+  font-family: var(--mono);
+  text-anchor: middle;
+  pointer-events: none;
+}
+
+/* The route the generated DSL will actually drive. */
+#map .route { stroke: var(--accent); stroke-width: 0.5; fill: none; }
+/* A hop whose destination is still waiting in the horizon. */
+#map .route.horizon { stroke-dasharray: 1.1 0.8; }
+
+/* ---------------------------------------------------------------------------
+   Scope bar
+   --------------------------------------------------------------------------- */
+
+.scope-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 13px;
+}
+.scope-label { color: var(--muted); }
+button.small { padding: 4px 10px; font-size: 12px; }
+
+/* ---------------------------------------------------------------------------
+   Robot picker
+   --------------------------------------------------------------------------- */
+
+.robots { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.robot {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+}
+.robot b { font-family: var(--mono); font-size: 13px; }
+.robot span { font-size: 11px; color: var(--muted); }
+.robot.offline { opacity: .55; }
+.robot.picked { border-color: var(--accent); background: #eff6ff; }
+
+/* ---------------------------------------------------------------------------
+   Extra output panels
+   --------------------------------------------------------------------------- */
+
+.unplaced, .warnings {
+  margin: 0;
+  padding: 12px;
+  max-height: 26vh;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #fbfcfd;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.warnings { color: var(--busy); }

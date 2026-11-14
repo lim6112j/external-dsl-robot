@@ -14,12 +14,14 @@ module RobotDSL.Agent.Prompt
   , userMessage
   , cleanOutput
   , headerKeywords
+  , robotSection
   ) where
 
 import Data.Text (Text)
 import qualified Data.Text as T
 
 import RobotDSL.Agent.Context (Vocabulary(..), standardActions)
+import RobotDSL.Agent.Fleet (RobotRef(..))
 
 -- | A conversation turn.
 data Role = RoleSystem | RoleUser | RoleAssistant
@@ -35,8 +37,8 @@ data ChatMessage = ChatMessage
 -- The order matters. The output rule comes first because the single most common
 -- failure is a model that wraps its answer in a markdown fence or prefixes it
 -- with a sentence, and the parser rejects both.
-systemPrompt :: Vocabulary -> Text
-systemPrompt voc = T.intercalate "\n\n"
+systemPrompt :: Maybe RobotRef -> Vocabulary -> Text
+systemPrompt robot voc = T.intercalate "\n\n"
   [ "You translate an operator request into a robotdsl source file. robotdsl is a "
    <> "small brace-delimited language that compiles to VDA 5050 v3.0.0 JSON for "
    <> "autonomous mobile robots."
@@ -46,6 +48,7 @@ systemPrompt voc = T.intercalate "\n\n"
    <> "strict parser, so any extra text is a hard failure. Start your reply with "
    <> "the first line of the source."
   , grammar
+  , robotSection robot
   , vocabularySection voc
   , "RULES THAT ARE EASY TO GET WRONG:\n"
    <> "1. Every name is a double-quoted string: node \"RK-AM\", zone \"no-go\".\n"
@@ -64,7 +67,9 @@ systemPrompt voc = T.intercalate "\n\n"
    <> "9. Prefer `go to \"<node>\" at (x, y)` over an explicit edge. Use an explicit "
    <> "edge only when a speed, corridor or trajectory is needed.\n"
    <> "10. actionType values come from the standard list. A robot may support "
-   <> "others, but do not invent one unless the operator names it."
+   <> "others, but do not invent one unless the operator names it.\n"
+   <> "11. Only travel between nodes that appear in the traversable hops list. "
+   <> "A hop the map does not have cannot be driven."
   , fewShot
   ]
 
@@ -141,6 +146,23 @@ vocabularySection voc = T.intercalate "\n" (mapSection ++ actionSection)
     actionSection =
       [ "action types: " <> T.intercalate ", " standardActions ]
 
+    -- The hops are the ground truth for what can actually be driven. Without
+    -- them the model invents a traversal the map does not have, and the
+    -- operator only finds out when a robot refuses the order.
+    hopsLine = case vocEdgePairs voc of
+      [] -> "traversable hops: none are known, so keep the mission to one node plus one destination."
+      ps -> "traversable hops (from -> to); only these exist: "
+              <> T.intercalate ", " (map fmt ps)
+
+    fmt (a, b) = a <> " -> " <> b
+
+    scopeLine = case vocScope voc of
+      Nothing -> []
+      Just picked ->
+        [ "scope: the operator restricted this mission to "
+            <> T.intercalate ", " picked
+            <> ". Do not leave it." ]
+
     mapSection = case (vocMapId voc, vocNodes voc) of
       (Nothing, []) ->
         [ "VOCABULARY"
@@ -155,10 +177,33 @@ vocabularySection voc = T.intercalate "\n" (mapSection ++ actionSection)
         , case vocEdges voc of
             [] -> "edge ids: (unnamed; let the compiler generate them)"
             es -> "edge ids: " <> T.intercalate ", " es
-        ]
+        , hopsLine
+        ] ++ scopeLine
 
     fromMaybeText Nothing = "(none given)"
     fromMaybeText (Just x) = x
+
+-- | Which robot the mission is for, when one is known.
+--
+-- The model needs the identity to write the @robot@ header declaration. The
+-- state is context: it stops the model proposing a pickup on a robot that is
+-- already driving something else, and it tells the operator what the generator
+-- believes it is talking to.
+robotSection :: Maybe RobotRef -> Text
+robotSection Nothing =
+  "ROBOT\nNo robot is selected. Write robot \"<manufacturer>\" \"<serialNumber>\" using the identity the operator names."
+robotSection (Just r) = T.intercalate "\n"
+  [ "ROBOT — this mission is for:"
+  , "robotId: " <> rrRobotId r
+  , "manufacturer: " <> rrManufacturer r
+  , "serialNumber: " <> rrSerialNumber r
+  , "state: " <> stateText
+  ]
+  where
+    stateText
+      | not (rrOnline r) = "offline"
+      | rrDriving r      = "online, driving order " <> rrOrderId r
+      | otherwise        = "online, idle"
 
 -- | Two worked examples, chosen to cover the two shapes operators ask for most.
 fewShot :: Text

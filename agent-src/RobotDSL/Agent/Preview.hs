@@ -1,0 +1,181 @@
+{-# LANGUAGE OverloadedStrings #-}
+-- | Lay a generated mission out on the map it will run on.
+--
+-- The emitted VDA 5050 order carries no edge endpoints: "RobotDSL.Emit" has
+-- nothing to derive them from, because the DSL's @Edge@ records only the
+-- constraints of a hop, never its two ends. The preview is therefore the only
+-- place an operator can see the route as a connected path — which nodes, in
+-- what order, released or still waiting.
+--
+-- This module is read-only. It never publishes and never writes, so a mission
+-- cannot be dispatched from here. Nodes and hops the map does not know are
+-- reported rather than rejected: Phase 1 does not dispatch, and an operator
+-- shown a gap can act on it, whereas an error only stops them.
+module RobotDSL.Agent.Preview
+  ( Preview(..)
+  , preview
+  , previewSource
+  ) where
+
+import Data.Maybe (isJust)
+import Data.Text (Text)
+import qualified Data.Text as T
+
+import RobotDSL.Agent.Context (Vocabulary(..))
+import RobotDSL.AST
+import RobotDSL.Parser (ParseError(..), parseProgram)
+
+-- | One mission laid out on the map.
+data Preview = Preview
+  { pvNodes :: ![(Text, Maybe (Double, Double))]
+  -- ^ Travel order. 'Nothing' means the map does not name the node, so it
+  -- cannot be drawn; the reason is in 'pvUnplaced'.
+  , pvHops :: ![(Text, Text)]
+  -- ^ Consecutive node pairs, in travel order. The fleet gateway derives its
+  -- own edges from exactly these pairs.
+  , pvReleased :: ![Bool]
+  -- ^ Aligned with 'pvNodes': True for the base, False for the horizon.
+  , pvUnplaced :: ![Text]
+  -- ^ Every node id and hop the map does not know.
+  , pvWarnings :: ![Text]
+  -- ^ Constructs the fleet-control gateway cannot express, so they would not
+  -- survive a dispatch. Advisory only: Phase 1 does not dispatch.
+  } deriving (Eq, Show)
+
+-- | Preview an already-parsed program.
+--
+-- Returns @Left@ only when there is nothing to preview at all — no order, or an
+-- order with no nodes. Everything else is reported inside the 'Preview'.
+preview :: Vocabulary -> Program -> Either [String] Preview
+preview voc prog =
+  case declOrders (progDecls prog) of
+    [] -> Left ["no order to preview: the source declares no order"]
+    (o : more) ->
+      case routeOf o of
+        [] -> Left ["the order has no nodes, so there is no route to draw"]
+        route ->
+          let ids  = map snd route
+              hops = zip ids (drop 1 ids)
+          in Right Preview
+               { pvNodes     = map (placeNode voc) route
+               , pvHops      = hops
+               , pvReleased  = map fst route
+               , pvUnplaced  = concatMap (unplacedNode voc) ids
+                            ++ concatMap (unplacedHop voc) hops
+               , pvWarnings  = zoneWarnings (progDecls prog)
+                            ++ edgeWarningsOf o
+                            ++ extraOrderWarning more
+               }
+
+-- | Parse, then preview.
+--
+-- The parser is the authority on validity, so a source that does not parse is
+-- reported here instead of producing a half-drawn route.
+previewSource :: Vocabulary -> Text -> Either [String] Preview
+previewSource voc src = case parseProgram "<preview>" src of
+  Left (ParseError msg) -> Left [T.unpack msg]
+  Right prog -> preview voc prog
+
+-- ---------------------------------------------------------------------------
+-- Route
+-- ---------------------------------------------------------------------------
+
+declOrders :: [Decl] -> [Order]
+declOrders ds = [o | DeclOrder o <- ds]
+
+-- | Flatten an order's segments into @(released, nodeId)@ in travel order.
+--
+-- The traversal matches the one "RobotDSL.Emit" performs, so the preview draws
+-- the same route the emitted message describes. Edges are deliberately not
+-- collected: the DSL records only their constraints, never their endpoints, so
+-- the hops come from the node sequence instead.
+routeOf :: Order -> [(Bool, Text)]
+routeOf o =
+  [ (segReleased seg, nodeId n)
+  | seg <- ordSegments o
+  , StepNode n <- segSteps seg
+  ]
+
+placeNode :: Vocabulary -> (Bool, Text) -> (Text, Maybe (Double, Double))
+placeNode voc (_, nid) = (nid, lookup nid (vocPositions voc))
+
+-- | A node the map does not name cannot be drawn, so it is reported rather
+-- than silently placed at the origin.
+unplacedNode :: Vocabulary -> Text -> [Text]
+unplacedNode voc nid
+  | nid `elem` vocNodes voc = []
+  | otherwise = ["node " <> nid <> " is not on the map"]
+
+-- | A hop between two nodes the map does know, but which the map does not
+-- connect, cannot be driven.
+--
+-- When the map carries no edges at all there is nothing to check against, and
+-- reporting every hop would bury the real problem, so that case is skipped. A
+-- hop touching an unknown node is already covered by 'unplacedNode'.
+unplacedHop :: Vocabulary -> (Text, Text) -> [Text]
+unplacedHop voc (a, b)
+  | null (vocEdgePairs voc) = []
+  | a `notElem` vocNodes voc || b `notElem` vocNodes voc = []
+  | (a, b) `elem` vocEdgePairs voc = []
+  | otherwise = ["there is no edge from " <> a <> " to " <> b]
+
+-- ---------------------------------------------------------------------------
+-- Warnings
+-- ---------------------------------------------------------------------------
+
+zoneWarnings :: [Decl] -> [Text]
+zoneWarnings ds
+  | null zss  = []
+  | otherwise =
+      [ "the fleet gateway has no zoneSet endpoint, so the "
+          <> T.pack (show (length zss))
+          <> " zone set(s) here will not reach the robot"
+      ]
+  where zss = [z | DeclZoneSet z <- ds]
+
+extraOrderWarning :: [Order] -> [Text]
+extraOrderWarning more
+  | null more = []
+  | otherwise =
+      [ "this file declares " <> T.pack (show (1 + length more))
+          <> " orders; only the first is previewed"
+      ]
+
+edgeWarningsOf :: Order -> [Text]
+edgeWarningsOf o = concat
+  [ edgeWarnings i e
+  | (i, StepEdge e) <- zip [0 ..] (concatMap segSteps (ordSegments o))
+  ]
+
+-- | What the fleet gateway drops from an edge.
+--
+-- It rebuilds every edge itself from the map — @e1@, @e2@, ... — with no
+-- actions and no constraints. Anything the DSL put on an edge is therefore lost
+-- on the way to a robot, which the operator should know before asking for a
+-- dispatch. The index matches the emitted @sequenceId@, so a warning names the
+-- same edge the operator sees in the JSON.
+edgeWarnings :: Int -> Edge -> [Text]
+edgeWarnings i e =
+  [ "edge " <> T.pack (show i) <> ": " <> name
+      <> " is dropped by the fleet gateway"
+  | (name, True) <- edgeConstraints e ]
+  ++ [ "edge " <> T.pack (show i) <> ": "
+         <> T.pack (show (length (edgeActions e)))
+         <> " action(s) here are dropped by the fleet gateway"
+     | not (null (edgeActions e))
+     ]
+
+edgeConstraints :: Edge -> [(Text, Bool)]
+edgeConstraints e =
+  [ ("maximumSpeed", isJust (edgeMaxSpeed e))
+  , ("maximumMobileRobotHeight", isJust (edgeMaxMobileRobotHeight e))
+  , ("minimumLoadHandlingDeviceHeight", isJust (edgeMinLoadHandlingDeviceHeight e))
+  , ("orientation", isJust (edgeOrientation e))
+  , ("orientationType", isJust (edgeOrientationType e))
+  , ("direction", isJust (edgeDirection e))
+  , ("reachOrientationBeforeEntering", isJust (edgeReachOrientationBeforeEntering e))
+  , ("maxRotationSpeed", isJust (edgeMaxRotationSpeed e))
+  , ("trajectory", isJust (edgeTrajectory e))
+  , ("length", isJust (edgeLength e))
+  , ("corridor", isJust (edgeCorridor e))
+  ]

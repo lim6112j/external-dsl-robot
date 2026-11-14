@@ -25,6 +25,7 @@ import Network.Wai.Handler.Warp (defaultSettings, runSettings, setFdCacheDuratio
 
 import RobotDSL.Agent.Client
 import RobotDSL.Agent.Context
+import RobotDSL.Agent.Fleet
 import RobotDSL.Agent.Server
 import RobotDSL.Emit
 import RobotDSL.Version
@@ -45,6 +46,11 @@ data Options = Options
   , optApiKey   :: !(Maybe Text)
   , optMaxTok   :: !Int
   , optMap      :: !(Maybe FilePath)
+  , optFleet    :: !(Maybe Text)
+  -- ^ Base URL of the fleet-control gateway, e.g. @http://127.0.0.1:8080@.
+  -- When given, the map and the robot list are read from it live.
+  , optGwToken  :: !(Maybe Text)
+  -- ^ Bearer token for the gateway, when it was started with @--api-token@.
   , optStt      :: !FilePath
   , optWebDir   :: !FilePath
   , optMfr      :: !Text
@@ -60,6 +66,8 @@ defaultOptions = Options
   , optApiKey  = Nothing
   , optMaxTok  = 2048
   , optMap     = Nothing
+  , optFleet   = Nothing
+  , optGwToken = Nothing
   , optStt     = "tools" </> "stt" </> "stt"
   , optWebDir  = "web"
   , optMfr     = "acme"
@@ -76,7 +84,22 @@ run opts = do
         Just k  -> pure (T.pack k)
         Nothing -> die "no API key: pass --api-key or set OPENROUTER_API_KEY"
 
-  vocabR <- loadVocabulary (optMap opts)
+  -- The manager is created first because resolving the map may need it: with
+  -- --fleet the map is fetched from the gateway instead of read from a file.
+  mgr <- newManager (tlsManagerSettings
+                       { managerResponseTimeout = responseTimeoutMicro (120 * 1000000) })
+
+  gwToken <- case optGwToken opts of
+    Just t  -> pure (Just t)
+    Nothing -> fmap T.pack <$> lookupEnv "ROBOT_GATEWAY_TOKEN"
+
+  let fleet = case optFleet opts of
+        Nothing -> Nothing
+        Just url -> Just (FleetConfig url gwToken)
+
+  vocabR <- case fleet of
+    Nothing -> loadVocabulary (optMap opts)
+    Just fc -> fmap (fmap vocabularyFrom) (fetchMap mgr fc)
   vocab <- case vocabR of
     Left err -> die err
     Right v  -> pure v
@@ -105,12 +128,7 @@ run opts = do
         , ccMaxTokens = optMaxTok opts
         }
 
-  -- The manager is created before the app state because the state now carries
-  -- it, so the TLS handshake happens once rather than per request.
-  mgr <- newManager (tlsManagerSettings
-                       { managerResponseTimeout = responseTimeoutMicro (120 * 1000000) })
-
-  st <- newAppState mgr client vocab ctx (optWebDir opts) (optStt opts)
+  st <- newAppState mgr client vocab fleet ctx (optWebDir opts) (optStt opts)
   ready <- doesFileExist (optStt opts)
 
   hPutStrLn stderr $ "robotdsl-agent listening on http://" ++ optHost opts
@@ -147,6 +165,8 @@ parseArgs = go defaultOptions
       "--api-key"       -> need as $ \v as' -> go (o { optApiKey = Just (T.pack v) }) as'
       "--max-tokens"    -> need as $ \v as' -> rd "max-tokens" v $ \n -> go (o { optMaxTok = n }) as'
       "--map"           -> need as $ \v as' -> go (o { optMap = Just v }) as'
+      "--fleet"         -> need as $ \v as' -> go (o { optFleet = Just (T.pack v) }) as'
+      "--gateway-token" -> need as $ \v as' -> go (o { optGwToken = Just (T.pack v) }) as'
       "--stt"           -> need as $ \v as' -> go (o { optStt = v }) as'
       "--web-dir"       -> need as $ \v as' -> go (o { optWebDir = v }) as'
       "--manufacturer"  -> need as $ \v as' -> go (o { optMfr = T.pack v }) as'
@@ -182,7 +202,12 @@ usage = unlines
   , "  --api-key K          OpenRouter key (default: $OPENROUTER_API_KEY)"
   , "  --max-tokens N       per-call cap (default 2048)"
   , "  --map PATH           VDA 5050 map JSON, giving the generator the real"
-  , "                        node ids. Strongly recommended."
+  , "                        node ids. Use when there is no gateway."
+  , "  --fleet URL          base URL of the fleet-control gateway, e.g."
+  , "                        http://127.0.0.1:8080. Reads the map and the"
+  , "                        robot list live, which beats --map."
+  , "  --gateway-token K    bearer token for the gateway (default:"
+  , "                        $ROBOT_GATEWAY_TOKEN)"
   , "  --stt PATH           voice helper binary (default tools/stt/stt)"
   , "  --web-dir DIR        where index.html lives (default web)"
   , "  --manufacturer M     manufacturer for emitted messages"
