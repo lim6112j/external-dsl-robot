@@ -40,6 +40,10 @@ data Preview = Preview
   , pvWarnings :: ![Text]
   -- ^ Constructs the fleet-control gateway cannot express, so they would not
   -- survive a dispatch. Advisory only: Phase 1 does not dispatch.
+  , pvWaste :: ![Text]
+  -- ^ A route that works but wanders. Advisory only, and deliberately not a
+  -- judgement: whether a detour is wanted is the operator's call, not this
+  -- module's. See 'routeWaste'.
   } deriving (Eq, Show)
 
 -- | Preview an already-parsed program.
@@ -65,6 +69,7 @@ preview voc prog =
                , pvWarnings  = zoneWarnings (progDecls prog)
                             ++ edgeWarningsOf o
                             ++ extraOrderWarning more
+               , pvWaste     = routeWaste ids
                }
 
 -- | Parse, then preview.
@@ -99,6 +104,39 @@ routeOf o =
 placeNode :: Vocabulary -> (Bool, Text) -> (Text, Maybe (Double, Double))
 placeNode voc (_, nid) = (nid, lookup nid (vocPositions voc))
 
+-- | Where a route that works nonetheless wanders.
+--
+-- A node visited more than once is the signal. It is not a mistake on its own
+-- — a mission that picks at A, drops at B and returns to A is legitimate, and
+-- only the operator knows which this is — but it is the shape a generator
+-- produces when it cannot plan a path: asked to go from AS-1W to AS-4E via
+-- DOOR-IN, it produced a route that reached DOOR-IN, came back through the
+-- node it had just left, and then took a different column. Every hop on it was
+-- real, so nothing else would have flagged it.
+--
+-- This deliberately does not compute a shortest path and compare. The operator
+-- may well have meant to detour; reporting a detour as wrong would be this
+-- module second-guessing the mission. It reports the fact and lets the
+-- operator judge.
+routeWaste :: [Text] -> [Text]
+routeWaste ids =
+  [ nid <> " is visited " <> T.pack (show (count nid)) <> " times"
+      <> ", so the robot backtracks through it"
+  | nid <- repeated
+  ]
+  where
+    repeated = [n | n <- nubOrd ids, count n > 1]
+    count n = length (filter (== n) ids)
+
+-- | Order-preserving deduplication, so a repeated node is reported at the
+-- position it first appears rather than in hash order.
+nubOrd :: [Text] -> [Text]
+nubOrd = go []
+  where
+    go _    []     = []
+    go seen (x:xs)
+      | x `elem` seen = go seen xs
+      | otherwise     = x : go (x : seen) xs
 -- | A node the map does not name cannot be drawn, so it is reported rather
 -- than silently placed at the origin.
 unplacedNode :: Vocabulary -> Text -> [Text]

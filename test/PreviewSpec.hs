@@ -77,6 +77,39 @@ previewTests =
             (any (T.isInfixOf "has no outgoing edge on this map at all")
                  (pvUnplaced pv))
 
+  , testCase "a node visited twice is reported as backtracking" $ do
+      -- 홉은 전부 유효하므로 맵 검사를 통과한다. 낭비는 따로 보고한다.
+      -- "최적이 아니다" 가 아니라 "되돌아간다" 는 사실만.
+      -- 픽스처 어휘(RK-AW, AS-3M, CHG-01)로 왕복 경로를 만든다.
+      -- 실제로 관찰된 shape: 목적지에 들렀다가 온 노드로 되돌아와 다른 길로 간다.
+      let voc = previewVocab
+                   { vocNodes     = ["RK-AW", "DOOR-IN", "AS-3M"]
+                   , vocEdgePairs =
+                       [ ("RK-AW", "DOOR-IN"), ("DOOR-IN", "RK-AW")
+                       , ("RK-AW", "AS-3M") ]
+                   }
+          src = T.unlines
+            [ "map \"plant-b\""
+            , "order \"o\" { base {"
+            , "  node \"RK-AW\" at (1.0, 2.0)"
+            , "  go to \"DOOR-IN\" at (12.0, 0.0)"
+            , "  go to \"RK-AW\" at (1.0, 2.0)"
+            , "  go to \"AS-3M\" at (3.0, 4.0)"
+            , "} }"
+            ]
+      case previewSource voc src of
+        Left errs -> assertFailure (unlines errs)
+        Right pv -> do
+          -- 맵 검사는 통과해야 한다. 재방문은 거부 사유이지 오류가 아니다.
+          assertEqual "the route is drivable" [] (pvUnplaced pv)
+          assertBool "the repeat is reported"
+            (any (T.isInfixOf "RK-AW is visited 2 times") (pvWaste pv))
+
+  , testCase "a route that visits each node once is quiet" $ do
+      case previewSource previewVocab previewDsl of
+        Left errs -> assertFailure (unlines errs)
+        Right pv  -> assertEqual "no waste reported" [] (pvWaste pv)
+
   , testCase "a map with no edges reports no hops at all" $ do
       -- Otherwise every hop would be flagged and bury the real problem.
       let voc = previewVocab { vocEdgePairs = [] }

@@ -392,21 +392,23 @@ resolveRobot st (Just want) = case asFleet st of
 -- couple the loop to the preview for no gain.
 previewValue :: Vocabulary -> Text -> Value
 previewValue vocab dsl = case previewSource vocab dsl of
-  Left errs -> previewFields [] [] [] (map T.pack errs) []
+  Left errs -> previewFields [] [] [] (map T.pack errs) [] []
   Right pv  -> previewFields
     (map previewNodeValue (pvNodes pv))
     (map previewHopValue (pvHops pv))
     (pvReleased pv)
     (pvUnplaced pv)
     (pvWarnings pv)
+    (pvWaste pv)
 
-previewFields :: [Value] -> [Value] -> [Bool] -> [Text] -> [Text] -> Value
-previewFields ns hs rel un wns = object
+previewFields :: [Value] -> [Value] -> [Bool] -> [Text] -> [Text] -> [Text] -> Value
+previewFields ns hs rel un wns wst = object
   [ "nodes"    .= ns
   , "hops"     .= hs
   , "released" .= rel
   , "unplaced" .= un
   , "warnings" .= wns
+  , "waste"    .= wst
   ]
 
 -- | A node in the preview. Coordinates are absent exactly when the map does
