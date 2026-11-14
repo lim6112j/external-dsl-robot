@@ -118,6 +118,20 @@ function showWarnings(pv) {
   el.className = "warnings";
 }
 
+// 경로 낭비: 홉은 전부 유효하지만 로봇이 되돌아다니는 구간.
+// 맵 검사를 통과한 경로라서 오류가 아니라 경고다.
+function showWaste(pv) {
+  const el = $("waste");
+  const list = (pv && pv.waste) || [];
+  if (list.length === 0) {
+    el.textContent = "없습니다";
+    el.className = "waste empty";
+    return;
+  }
+  el.textContent = list.map((e) => "• " + e).join("\n");
+  el.className = "waste";
+}
+
 function usageText(u) {
   if (!u) return "";
   return ", 토큰 " + u[0] + "+" + u[1];
@@ -126,6 +140,12 @@ function usageText(u) {
 // ---------------------------------------------------------------------------
 // 맵
 // ---------------------------------------------------------------------------
+
+// 맵 안에서 쓰는 크기들. 전부 맵 단위(미터)이고, 픽셀이 아니다. 맵 패널이
+// 약 660px 에 viewBox 폭 43 유닛이므로 1 유닛 이 약 15px 다.
+const NODE_R = 0.75;      // 노드 원 반경. 1.2 였을 때 지름 37px 라 경로를 덮었다.
+const LABEL_FS = 0.575;   // 라벨 폰트. 1.15 의 절반.
+const LABEL_CH = 0.345;   // 문자 하나 너비(LABEL_FS * 0.6).
 
 // 미리보기가 있으면 경로를 얹어 그리고, 없으면 맵만 그린다.
 //
@@ -147,7 +167,11 @@ function renderMap(pv) {
   const minY = Math.min(...ys), maxY = Math.max(...ys);
   const spanX = maxX - minX || 1;
   const spanY = maxY - minY || 1;
-  const pad = Math.max(2, spanX * 0.06);
+  // 라벨이 viewBox 밖으로 나가면 잘린다. 라벨은 노드에서 원 반경 + 여유 +
+  // 폰트 높이만큼(약 1.8 유닛) 나가고, 옆으로는 제일 긴 id(CONV-OUT)가
+  // 절반씩 1.4 유닛 나간다. 맵 단위로 고정된 크기이므로 여유도 맵 단위로
+  // 고정해서 준다. 지도가 크면 여유도 비례해서 조금 더 준다.
+  const pad = Math.max(3.5, spanX * 0.06, spanY * 0.06);
   svg.setAttribute("viewBox",
     (minX - pad) + " " + (minY - pad) + " " +
     (spanX + 2 * pad) + " " + (spanY + 2 * pad));
@@ -169,32 +193,87 @@ function renderMap(pv) {
   for (let i = 0; i < route.length; i++) {
     const n = route[i];
     if (n.x === null || n.y === null) continue;
-    pts.push({ x: n.x, y: n.y, rel: pv.released ? pv.released[i] : true });
+    pts.push({
+      id: n.id,
+      x: n.x,
+      y: n.y,
+      rel: pv.released ? pv.released[i] : true,
+    });
   }
   for (let i = 0; i + 1 < pts.length; i++) {
     const a = pts[i], b = pts[i + 1];
     // 목적지가 released false 이면 그 구간이 horizon 이다.
-    const cls = b.rel ? "route" : "route horizon";
+    let cls = b.rel ? "route" : "route horizon";
+    // 방금 떠난 노드로 되돌아가는 구간은 낭비다. 홉 자체는 유효해서 맵
+    // 검사를 통과하지만, 로봇이 같은 자리를 두 번 지나는 것이다.
+    if (i > 0 && pts[i - 1].id === b.id) cls += " backtrack";
     parts.push('<line class="' + cls + '" x1="' + a.x + '" y1="' + a.y +
                '" x2="' + b.x + '" y2="' + b.y + '"/>');
   }
 
   // 3. 노드. 경로에 포함된 것은 강조한다.
-  const onRoute = new Set(pts.map((p) => p.x + "," + p.y));
+  const onRoute = new Set(pts.map((p) => p.id));
   for (const [id, p] of nodes) {
     const scoped = state.scope.has(id);
-    const used = onRoute.has(p.x + "," + p.y);
+    const used = onRoute.has(id);
     let cls = "node";
     if (scoped) cls += " scoped";
     if (used) cls += " used";
     parts.push('<circle class="' + cls + '" cx="' + p.x + '" cy="' + p.y +
-               '" r="1.2" data-id="' + id + '"/>');
+               '" r="' + NODE_R + '" data-id="' + id + '"/>');
   }
 
-  // 4. 라벨은 맨 위에. 노드가 35 개쯤 되면 겹치므로 호버로 확대한다.
+  // 4. 라벨. 자리가 없는 쪽이 있어 후보를 네 개 두고 고른다.
+  //
+  // 한쪽에만 붙이면 안 된다. 가운데 열은 세로 2 유닛 간격이라 반경 0.75 인 원
+  // 사이 틈이 0.5 유닛 밖에 없고, 라벨은 1.15 유닛이라 위아래로는 낄 자리가
+  // 없다 — AS-1M 의 라벨이 RK-AM 원과 겹쳤던 것이 그것이다. 그래서 기본은
+  // 옆이다. 그런데 동쪽 열은 오른쪽이 막혀 왼쪽으로 가고, 그게 DOOR-OUT
+  // 라벨과 겹친다. 맨 위줄(y=0)은 위가 비어 있으니 위에 붙이면 자유롭다.
+  //
+  // 후보 순서: 오른쪽, 왼쪽, 위, 아래. 다른 라벨·원과 겹치지 않는 첫 번째를
+  // 고르고, 네 개 다 겹치면 마지막 후보를 쓴다(겹쳐도 라벨이 없는 것보다 낫다).
+  const placed = [];
   for (const [id, p] of nodes) {
-    parts.push('<text class="node-label" x="' + p.x + '" y="' + (p.y - 1.9) +
-               '">' + id + "</text>");
+    const w = id.length * LABEL_CH;
+    const h = LABEL_FS;
+    const gap = 0.25;  // 노드 원과 라벨 사이 여유
+    const cands = [
+      { x: p.x + NODE_R + gap, y: p.y + 0.42, anchor: "start" },
+      { x: p.x - NODE_R - gap, y: p.y + 0.42, anchor: "end" },
+      { x: p.x, y: p.y - NODE_R - gap - 0.1, anchor: "middle" },
+      { x: p.x, y: p.y + NODE_R + gap + h, anchor: "middle" },
+    ];
+    const pick = cands.find((c) => fits(c, id, w, h)) || cands[cands.length - 1];
+    placed.push({ id: id, box: boxOf(pick, id, w, h) });
+    parts.push('<text class="node-label" x="' + pick.x + '" y="' + pick.y +
+               '" text-anchor="' + pick.anchor + '">' + id + "</text>");
+  }
+
+  // 후보 자리가 실제로 비어 있는지. viewBox 안에 들어오고, 이미 놓인 라벨이나
+  // 원과 겹치지 않아야 한다.
+  function fits(c, id, w, h) {
+    const b = boxOf(c, id, w, h);
+    if (b[0] < minX - pad || b[2] > maxX + pad) return false;
+    if (b[1] < minY - pad || b[3] > maxY + pad) return false;
+    for (const q of placed) {
+      if (b[0] < q.box[2] && q.box[0] < b[2] &&
+          b[1] < q.box[3] && q.box[1] < b[3]) return false;
+    }
+    for (const [oid, op] of nodes) {
+      if (oid === id) continue;
+      if (b[0] < op.x + NODE_R && op.x - NODE_R < b[2] &&
+          b[1] < op.y + NODE_R && op.y - NODE_R < b[3]) return false;
+    }
+    return true;
+  }
+
+  function boxOf(c, id, w, h) {
+    let x0, x1;
+    if (c.anchor === "start") { x0 = c.x; x1 = c.x + w; }
+    else if (c.anchor === "end") { x0 = c.x - w; x1 = c.x; }
+    else { x0 = c.x - w / 2; x1 = c.x + w / 2; }
+    return [x0, c.y - h, x1, c.y + h * 0.3];
   }
 
   svg.innerHTML = parts.join("\n");
@@ -279,6 +358,7 @@ async function sendCommand(text) {
     showMessages(r.messages);
     showUnplaced(r.preview);
     showWarnings(r.preview);
+    showWaste(r.preview);
     renderMap(r.preview);
     showErrors([]);
     setStatus("성공 — " + r.attempts + "회 시도" + usageText(r.usage), "ok");
@@ -288,6 +368,8 @@ async function sendCommand(text) {
     showMessages([]);
     showUnplaced(null);
     showWarnings(null);
+  showWaste(null);
+    showWaste(null);
     renderMap(null);
     showErrors(r.errors && r.errors.length ? r.errors : [r.error || "알 수 없는 오류"]);
     setStatus("실패", "err");
@@ -320,6 +402,7 @@ async function recompile() {
     showMessages(r.messages);
     showUnplaced(r.preview);
     showWarnings(r.preview);
+    showWaste(r.preview);
     renderMap(r.preview);
     showErrors([]);
     setStatus("컴파일 성공", "ok");
@@ -327,6 +410,8 @@ async function recompile() {
     showMessages([]);
     showUnplaced(null);
     showWarnings(null);
+  showWaste(null);
+    showWaste(null);
     renderMap(null);
     showErrors(r.errors && r.errors.length ? r.errors : [r.error || "알 수 없는 오류"]);
     setStatus("컴파일 실패", "err");
@@ -361,6 +446,7 @@ async function resetSession() {
   showMessages([]);
   showUnplaced(null);
   showWarnings(null);
+  showWaste(null);
   renderMap(null);
   showErrors([]);
   setStatus("대화를 초기화했습니다", "ok");
