@@ -22,6 +22,17 @@ const state = {
   selectedRobot: null,
 };
 
+// 미리 적어둔 작업지시. 입력창에 직접 치는 대신 고르면 되므로, 처음 쓰는
+// 사람이 뭘 물어봐야 할지 감을 잡을 수 있다. 이 문장들은 plant-b/l1 맵의
+// 실제 노드 이름을 쓴다 — 다른 맵을 쓰면 주소가 안 맞을 수 있다.
+const EXAMPLES = [
+  "RK-AM 에서 팔레트를 집어 CHG-01 로 가져다줘",
+  "랙 A 중앙에서 컨베이어 출구까지 팔레트를 옮겨줘",
+  "STG-01 에서 팔레트를 집어 AS-4E 근처에 내려놔줘",
+  "CHG-01 에 가서 30 초 동안 충전해줘",
+  "AS-1W 에서 팔레트를 집어 DOOR-IN 을 지나 AS-4E 로 가져다줘",
+];
+
 async function api(path, body) {
   const opts = {};
   if (body !== undefined) {
@@ -390,6 +401,25 @@ async function loadContext() {
   }
 }
 
+// 예시 문구를 칩으로 그린다. 고르면 입력창에 들어가고, 바로 보낼 수 있다.
+function renderExamples() {
+  const box = $("examples");
+  box.innerHTML = "";
+  EXAMPLES.forEach((text) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "example";
+    b.textContent = text;
+    b.title = "이 문장을 입력창에 넣습니다";
+    b.addEventListener("click", () => {
+      $("cmd").value = text;
+      $("cmd").focus();
+      setStatus("예시를 입력창에 넣었습니다. 보내기 를 누르세요.", "");
+    });
+    box.appendChild(b);
+  });
+}
+
 $("send").addEventListener("click", () => sendCommand($("cmd").value));
 $("listen").addEventListener("click", listen);
 $("recompile").addEventListener("click", recompile);
@@ -404,4 +434,5 @@ $("cmd").addEventListener("keydown", (e) => {
   if (e.key === "Enter") sendCommand($("cmd").value);
 });
 
+renderExamples();
 loadContext();

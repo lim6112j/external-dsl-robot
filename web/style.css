@@ -212,6 +212,39 @@ button.ghost { background: transparent; }
 button.small { padding: 4px 10px; font-size: 12px; }
 
 /* ---------------------------------------------------------------------------
+   Example prompts
+
+   One line of chips above the command box. They wrap, because five sentences
+   do not fit a narrow panel, and they are left-aligned rather than spread so
+   the row still reads as a list of choices rather than a toolbar.
+   --------------------------------------------------------------------------- */
+.examples {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+button.example {
+  padding: 4px 10px;
+  font-size: 12px;
+  text-align: left;
+  border-radius: 999px;
+  background: #fff;
+  color: var(--muted);
+}
+
+button.example:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+button.example:focus-visible {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* ---------------------------------------------------------------------------
    Robot picker
    --------------------------------------------------------------------------- */
 
