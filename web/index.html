@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>robotdsl agent</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div class="title">
+    <h1>robotdsl agent</h1>
+    <p class="sub">자연어 또는 음성으로 VDA 5050 v3.0.0 미션을 만듭니다</p>
+  </div>
+  <dl id="meta" class="meta"></dl>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>명령</h2>
+    <div class="row">
+      <input id="cmd" type="text" autocomplete="off"
+             placeholder="예: 랙에서 팔레트를 집어 컨베이어 A로 가져다줘">
+      <button id="send" class="primary">보내기</button>
+      <button id="listen" title="마이크로 한 문장을 말합니다">🎤 음성</button>
+    </div>
+    <p id="status" class="status" role="status"></p>
+
+    <h2>생성된 DSL <span class="hint">직접 고친 뒤 다시 컴파일할 수 있습니다</span></h2>
+    <textarea id="dsl" spellcheck="false" rows="18"></textarea>
+    <div class="row">
+      <button id="recompile">다시 컴파일</button>
+      <span class="sep"></span>
+      <label for="path" class="path-label">저장 경로</label>
+      <input id="path" type="text" value="mission.robot" autocomplete="off">
+      <button id="save">저장</button>
+      <span class="grow"></span>
+      <button id="reset" class="ghost">새 대화</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>미리보기 <span class="hint">컴파일된 VDA 5050 메시지</span></h2>
+    <pre id="preview" class="preview empty">아직 없습니다</pre>
+
+    <h2>오류</h2>
+    <pre id="errors" class="errors empty">없습니다</pre>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

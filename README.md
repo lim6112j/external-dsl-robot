@@ -30,12 +30,14 @@ full `zoneType` vocabulary (`BLOCKED`, `LINE_GUIDED`, `RELEASE`,
 ## Build
 
 ```bash
-cabal build          # library + CLI
-cabal test           # 41 tests
+cabal build          # library, CLI and the agent
+cabal test           # 70 tests
 ```
 
-Requires GHC 9.10 (developed against 9.10.3) and cabal. Dependencies: `aeson`,
-`megaparsec`, `text`, `containers`, `time`.
+Requires GHC 9.10 (developed against 9.10.3) and cabal. The core DSL depends on
+`aeson`, `megaparsec`, `text`, `containers` and `time`. The agent additionally
+needs `warp`, `wai` and `http-conduit`; those live in a separate private
+sublibrary so that `robotdsl` itself never links a web server.
 
 ```bash
 cabal run robotdsl -- check examples/palletizing.robot
@@ -45,6 +47,39 @@ cabal run robotdsl -- compile examples/palletizing.robot --out out/
 The binary is not put on your `PATH` by `cabal build`. See
 [Troubleshooting](#troubleshooting) for how to run it either way, and note that
 `compile` resolves its schema directory relative to the current directory.
+
+## AI agent interface
+
+`robotdsl-agent` puts a chat and voice front end on the compiler. An operator
+types or speaks a request in Korean; a model on OpenRouter turns it into
+robotdsl source; the existing parser and validator then decide whether that
+source is acceptable.
+
+The model is only ever a translator. Nothing reaches the operator, and nothing
+is written to disk, unless `RobotDSL.Parser` and `RobotDSL.Validate` both
+accept the output. When they reject it, the exact error is fed back for another
+attempt, up to three times.
+
+```bash
+# build the voice helper once (macOS Speech framework, on-device)
+tools/stt/build.sh
+
+cabal run robotdsl-agent -- --map ../로봇관제시스템/deploy/maps/plant-b.l1.json
+# then open http://127.0.0.1:8790
+```
+
+| route | purpose |
+|---|---|
+| `POST /api/command` | generate DSL from text, on a session |
+| `POST /api/listen` | transcribe one utterance via the Swift helper |
+| `POST /api/compile` | recompile DSL edited in the browser |
+| `POST /api/save` | write the file, after re-validating |
+| `POST /api/reset` | clear the conversation |
+| `GET /api/context` | vocabulary and identity in use |
+
+`--map` is the single biggest quality lever: without it the generator has no
+real node ids and will invent plausible-looking ones. The server binds to
+`127.0.0.1` by default because it has no authentication.
 
 ## The language
 
@@ -308,8 +343,17 @@ src/RobotDSL/
   Validate.hs   semantic rules, one Issue per problem
   Emit.hs       AST -> VDA 5050 JSON, owns all mandatory bookkeeping
   Schema.hs     draft-2020-12 validator for the vendored schemas
-app/Main.hs     CLI
-test/           parser, emitter and schema tests
+agent-src/RobotDSL/Agent/
+  Context.hs    map JSON -> node and action vocabulary
+  Prompt.hs     system prompt and output cleaning
+  Client.hs     OpenRouter (OpenAI-compatible) call
+  Loop.hs       generate -> parse -> validate -> retry
+  Server.hs     wai application and routes
+app/Main.hs     the robotdsl CLI
+app/AgentMain.hs  the robotdsl-agent entry point
+web/            the browser UI, no build step
+tools/stt/      Swift voice helper plus build.sh
+test/           parser, emitter, schema and agent tests
 examples/       three worked examples
 schemas/        the official v3.0.0 JSON Schemas
 ```

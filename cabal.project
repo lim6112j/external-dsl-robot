@@ -3,3 +3,11 @@ packages: .
 -- Development builds: -O0 keeps the edit/compile/test loop fast. Bump to 1
 -- for a release build.
 optimization: 0
+
+-- The agent stack (warp, http-conduit, tls) transitively needs zlib. On this
+-- machine /usr/lib ships only libz.1.2.12.dylib and zlib.h lives inside the
+-- Xcode SDK, so cabal's foreign-library probe cannot find either the library
+-- file or the header. Building the bundled C sources sidesteps the system
+-- zlib entirely, which also removes the Xcode SDK from the build's requirements.
+package zlib
+  flags: +bundled-c-zlib
