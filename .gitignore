@@ -13,3 +13,4 @@ out/
 
 # Swift voice helper build output (rebuild with tools/stt/build.sh)
 tools/stt/stt
+/.stepcode/plans
