@@ -20,6 +20,9 @@ const state = {
   edges: [],
   scope: new Set(),
   selectedRobot: null,
+  // --fleet 이 주어졌는지. 로봇이 0 대일 때 "연결 안 됨" 과 "연결됐는데
+  // 로봇이 없음" 을 가르는 유일한 근거다.
+  hasFleet: false,
 };
 
 // 미리 적어둔 작업지시. 입력창에 직접 치는 대신 고르면 되므로, 처음 쓰는
@@ -302,33 +305,44 @@ function syncScopeUI() {
 // 로봇
 // ---------------------------------------------------------------------------
 
-function renderRobots(robots) {
+// 빈 로봇 목록은 서로 다른 세 가지를 뜻하는데, 전부 같은 말로 보여주면
+// 운영자가 엉뚱한 곳을 고친다:
+//   --fleet 을 안 줌 / 게이트웨이에 닿지 못함 / 연결됐는데 로봇이 0대.
+function renderRobots(robots, fleetError) {
   const el = $("robots");
-  if (!robots || robots.length === 0) {
-    el.innerHTML = '<span class="empty">플릿에 연결되지 않았습니다</span>';
-    el.className = "robots empty";
+  if (robots && robots.length > 0) {
+    el.className = "robots";
+    el.innerHTML = "";
+    for (const r of robots) {
+      const b = document.createElement("button");
+      b.className = "robot" + (r.online ? "" : " offline");
+      b.setAttribute("data-robot", r.robotId);
+      b.disabled = !r.online;
+      const st = r.driving ? "주행 중 · " + (r.orderId || "?") : "대기";
+      b.innerHTML = "<b>" + r.robotId + "</b><span>" + st + "</span>";
+      b.title = r.online
+        ? "이 로봇에게 명령합니다"
+        : "오프라인이라 선택할 수 없습니다";
+      if (r.online) {
+        b.addEventListener("click", () => {
+          state.selectedRobot =
+            state.selectedRobot === r.robotId ? null : r.robotId;
+          syncRobotUI();
+        });
+      }
+      el.appendChild(b);
+    }
     return;
   }
-  el.className = "robots";
-  el.innerHTML = "";
-  for (const r of robots) {
-    const b = document.createElement("button");
-    b.className = "robot" + (r.online ? "" : " offline");
-    b.setAttribute("data-robot", r.robotId);
-    b.disabled = !r.online;
-    const st = r.driving ? "주행 중 · " + (r.orderId || "?") : "대기";
-    b.innerHTML = "<b>" + r.robotId + "</b><span>" + st + "</span>";
-    b.title = r.online
-      ? "이 로봇에게 명령합니다"
-      : "오프라인이라 선택할 수 없습니다";
-    if (r.online) {
-      b.addEventListener("click", () => {
-        state.selectedRobot =
-          state.selectedRobot === r.robotId ? null : r.robotId;
-        syncRobotUI();
-      });
-    }
-    el.appendChild(b);
+  el.className = "robots empty";
+  if (fleetError) {
+    el.textContent = "플릿에 연결할 수 없습니다: " + fleetError;
+  } else if (state.hasFleet) {
+    el.textContent =
+      "연결됐지만 로봇이 보이지 않습니다. 시뮬레이터를 켰나요?";
+  } else {
+    el.textContent =
+      "플릿에 연결되지 않았습니다. --fleet URL 로 게이트웨이를 주세요.";
   }
 }
 
@@ -478,7 +492,8 @@ async function loadContext() {
   state.scope = new Set();
   renderMap(null);
   syncScopeUI();
-  renderRobots(c.robots);
+  state.hasFleet = !!c.hasFleet;
+  renderRobots(c.robots, c.fleetError);
   syncRobotUI();
 
   if (!c.sttReady) {

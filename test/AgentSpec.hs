@@ -15,6 +15,7 @@ import qualified Data.ByteString.Lazy as BL
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Vector as V
 
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -301,6 +302,46 @@ tests = pure
           assertBool "the robots were read"
                      (any ((== "/api/robots") . snd) reqs)
 
+    , testCase "a map that appears after startup is picked up" $
+        -- 회귀: 맵은 예전에 시작 시 한 번만 가져왔다. 그래이트웨이보다 먼저
+        -- 뜬 에이전트는 영원히 맵이 비어 있었고, 화면에 이유가 없었다.
+        -- 이제 매 요청마다 다시 읽으므로 나중에 뜬 게이트웨이도 보인다.
+        withStub (const goodDsl) $ \stub -> do
+          seen <- newIORef []
+          testWithApplication (pure (gatewayRecorder seen)) $ \gwPort ->
+            testWithApplication
+              (serverAppWithNoMap
+                 (Just (FleetConfig
+                          (T.pack ("http://127.0.0.1:" ++ show gwPort)) Nothing))
+                 (stubMgr stub) (stubCfg stub))
+              $ \port -> do
+                let mgr = stubMgr stub
+                    url = baseUrl port <> "/api/context"
+                v <- getJson mgr url
+                assertBool "the map arrived from the gateway"
+                           (not (null (arrField v "nodes")))
+                assertBool "the node ids are the gateway's"
+                           (any (\n -> strField n "id" == "RK-AM")
+                                (arrField v "nodes"))
+                assertEqual "no fleet error" Nothing (strFieldMaybe v "fleetError")
+
+    , testCase "a gateway that is unreachable keeps the map it had" $
+        -- 일시적으로 끊긴 게이트웨이가 어휘를 비우면 안 된다. 노드 id 가 사라지면
+        -- 생성기는 이름을 지어내는 쪽으로 돌아간다.
+        withStub (const goodDsl) $ \stub -> do
+          testWithApplication
+            (serverAppWith
+               (Just (FleetConfig (T.pack "http://127.0.0.1:9") Nothing))
+               (stubMgr stub) (stubCfg stub))
+            $ \port -> do
+              let mgr = stubMgr stub
+                  url = baseUrl port <> "/api/context"
+              v <- getJson mgr url
+              assertBool "the startup map is kept"
+                         (not (null (arrField v "nodes")))
+              assertBool "the operator is told the fleet did not answer"
+                         (isJust (strFieldMaybe v "fleetError"))
+
     , testCase "the picked robot reaches the generator" $
         withServerAndGateway $ \port mgr stub _ -> do
           _ <- postJson mgr (baseUrl port <> "/api/command")
@@ -398,6 +439,13 @@ assertOk r = unless (lrOk r) $
 
 assertNotOk :: LoopResult -> IO ()
 assertNotOk r = when (lrOk r) $ assertFailure "expected failure"
+
+-- | A string field that may be absent or null. Unlike 'strField' this does
+-- not throw, so it can be used where the answer is expected to be Nothing.
+strFieldMaybe :: Value -> Text -> Maybe Text
+strFieldMaybe v k = case objLookup k v of
+  Just (String s) -> Just s
+  _               -> Nothing
 
 strField :: Value -> Text -> Text
 strField v k = case objLookup k v of
@@ -523,14 +571,25 @@ serverApp = serverAppWith Nothing
 -- @fleet@ is @Nothing@ for every test that does not care, so the default
 -- stays "no gateway" rather than "some gateway".
 serverAppWith :: Maybe FleetConfig -> Manager -> ClientConfig -> IO Application
-serverAppWith fleet mgr client = do
-  let vocab = Vocabulary (Just "plant-b") ["RK-AM", "CHG-01"] []
-                              [("RK-AM", "CHG-01")] Nothing
-                              [("RK-AM", (1.0, 2.0)), ("CHG-01", (3.0, 4.0))]
-      emitCtx = EmitContext "acme" "AMR-001" 1 "2026-01-01T00:00:00.000Z"
+serverAppWith fleet mgr client = serverAppWithVocab fleet mgr client testVocab
+
+-- | The agent with an empty vocabulary, as if it had started before the
+-- gateway was up.
+serverAppWithNoMap :: Maybe FleetConfig -> Manager -> ClientConfig -> IO Application
+serverAppWithNoMap fleet mgr client = serverAppWithVocab fleet mgr client emptyVocabulary
+
+serverAppWithVocab
+  :: Maybe FleetConfig -> Manager -> ClientConfig -> Vocabulary -> IO Application
+serverAppWithVocab fleet mgr client vocab = do
+  let emitCtx = EmitContext "acme" "AMR-001" 1 "2026-01-01T00:00:00.000Z"
                             protocolVersion (Just "plant-b")
   st <- newAppState mgr client vocab fleet emitCtx "web" ""
   pure (app st)
+
+testVocab :: Vocabulary
+testVocab = Vocabulary (Just "plant-b") ["RK-AM", "CHG-01"] []
+                      [("RK-AM", "CHG-01")] Nothing
+                      [("RK-AM", (1.0, 2.0)), ("CHG-01", (3.0, 4.0))]
 
 baseUrl :: Port -> String
 baseUrl port = "http://127.0.0.1:" ++ show port

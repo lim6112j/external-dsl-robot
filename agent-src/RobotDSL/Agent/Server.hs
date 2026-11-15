@@ -15,6 +15,7 @@ module RobotDSL.Agent.Server
   ) where
 
 import Control.Exception (SomeException, try)
+import Control.Applicative ((<|>))
 import Data.Aeson (Value(..), object, (.=))
 import qualified Data.Aeson
 import qualified Data.Aeson.Key as Key
@@ -23,7 +24,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (find, isSuffixOf)
-import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -56,7 +57,9 @@ data AppState = AppState
   { asManager   :: !Manager
   -- ^ Connection manager, created once so TLS is not renegotiated per call.
   , asClient    :: !ClientConfig
-  , asVocab     :: !Vocabulary
+  , asVocab     :: !(IORef Vocabulary)
+  -- ^ The last map the gateway gave us. Held in a ref because the map is
+  -- re-read on demand; see 'refreshVocab'.
   , asFleet     :: !(Maybe FleetConfig)
   -- ^ How to reach the fleet-control gateway. 'Nothing' means the agent works
   -- from @--map@ alone and reports no robots, rather than failing.
@@ -70,7 +73,8 @@ data AppState = AppState
 newAppState :: Manager -> ClientConfig -> Vocabulary -> Maybe FleetConfig
             -> EmitContext -> FilePath -> FilePath -> IO AppState
 newAppState mgr cli vocab fleet emitCtx webDir sttPath =
-  AppState mgr cli vocab fleet emitCtx <$> newIORef [] <*> pure webDir <*> pure sttPath
+  AppState mgr cli <$> newIORef vocab <*> pure fleet <*> pure emitCtx
+          <*> newIORef [] <*> pure webDir <*> pure sttPath
 
 app :: AppState -> Application
 app st req respond =
@@ -110,28 +114,63 @@ app st req respond =
 -- than an extra local GET per page load. A gateway that cannot be reached is
 -- reported as a reason instead of an error, because the operator can still
 -- type a command — the DSL will simply name the robot itself.
+-- | The vocabulary to serve right now, re-read from the gateway.
+--
+-- The map is otherwise fetched once at startup, so an agent started before the
+-- gateway came up reports no map forever. Nothing on screen distinguishes that
+-- from a gateway that is genuinely unreachable, which is exactly the
+-- confusion: the operator sees an empty map and no reason.
+--
+-- A failed re-read keeps the previous vocabulary instead of clearing it. A
+-- gateway that blips should not silently strip the node ids the generator
+-- needs — the mission would then be built from invented names. The error is
+-- returned so the operator can see the map may be stale.
+refreshVocab :: AppState -> IO (Vocabulary, Maybe String)
+refreshVocab st = case asFleet st of
+  Nothing -> do
+    v <- readIORef (asVocab st)
+    pure (v, Nothing)
+  Just fc -> do
+    r <- fetchMap (asManager st) fc
+    case r of
+      Left e -> do
+        stale <- readIORef (asVocab st)
+        pure (stale, Just e)
+      Right v -> do
+        let fresh = vocabularyFrom v
+        writeIORef (asVocab st) fresh
+        pure (fresh, Nothing)
+
 handleContext :: AppState -> Respond -> IO ResponseReceived
 handleContext st respond = do
   ready <- doesFileExist (asSttPath st)
+  (vocab, mapErr) <- refreshVocab st
   robots <- case asFleet st of
     Nothing -> pure (Right [])
     Just fc -> fetchRobots (asManager st) fc
-  json respond status200 (contextValue st ready robots)
+  json respond status200 (contextValue st ready robots mapErr vocab)
 
-contextValue :: AppState -> Bool -> Either String [RobotRef] -> Value
-contextValue st sttReady robots = object
-  [ "mapId"        .= vocMapId (asVocab st)
-  , "nodes"        .= map mapNodeValue (vocPositions (asVocab st))
-  , "nodeIds"      .= vocNodes (asVocab st)
-  , "edges"        .= map mapEdgeValue (vocEdgePairs (asVocab st))
+contextValue :: AppState -> Bool -> Either String [RobotRef] -> Maybe String
+            -> Vocabulary -> Value
+contextValue st sttReady robots mapErr vocab = object
+  [ "mapId"        .= vocMapId vocab
+  , "nodes"        .= map mapNodeValue (vocPositions vocab)
+  , "nodeIds"      .= vocNodes vocab
+  , "edges"        .= map mapEdgeValue (vocEdgePairs vocab)
   , "actions"      .= standardActions
   , "robots"       .= map robotValue (either (const []) id robots)
-  , "fleetError"   .= either Just (const Nothing) robots
+  -- A map error and a robot error both mean "the fleet did not answer", so
+  -- either is enough to warn the operator that the map may be stale.
+  , "fleetError"   .= (mapErr <|> either Just (const Nothing) robots)
+  -- Whether --fleet was given at all. The browser uses it to tell "not
+  -- configured" apart from "configured but no robots answered", which are
+  -- different problems with different fixes.
+  , "hasFleet"      .= isJust (asFleet st)
   , "model"        .= ccModel (asClient st)
   , "manufacturer" .= ecManufacturer (asEmitCtx st)
   , "serialNumber" .= ecSerialNumber (asEmitCtx st)
   , "version"      .= protocolVersionText (ecVersion (asEmitCtx st))
-  , "hasMap"       .= not (null (vocNodes (asVocab st)))
+  , "hasMap"       .= not (null (vocNodes vocab))
   , "sttReady"     .= sttReady
   ]
 
@@ -166,7 +205,11 @@ handleCommand st req respond = do
             -- A scope the operator picked narrows the generator's vocabulary.
             -- The preview still checks against the whole map, so a mission
             -- that strays outside the scope stays visible.
-            vocab = applyScope (fieldList "scope" v) (asVocab st)
+        -- The map is re-read here too, not only in handleContext: a command
+        -- sent before the page's context call would otherwise be generated
+        -- from whatever map the agent happened to start with.
+        (fresh, _) <- refreshVocab st
+        let vocab = applyScope (fieldList "scope" v) fresh
         robot <- resolveRobot st (field "robotId" v)
         history <- lookupSession st sid
         res <- runLoop (loopConfigWith st vocab robot) history txt
@@ -188,7 +231,7 @@ handleCommand st req respond = do
               , "messages" .= lrMessages res
               , "attempts" .= lrAttempts res
               , "usage"    .= lrUsage res
-              , "preview"  .= previewValue (asVocab st) (lrDsl res)
+              , "preview"  .= previewValue vocab (lrDsl res)
               ])
 
 handleCompile :: AppState -> Request -> Respond -> IO ResponseReceived
@@ -199,16 +242,18 @@ handleCompile st req respond = do
                   (failValue ("could not parse the request: " ++ err))
     Right v -> case field "dsl" v of
       Nothing -> json respond status400 (failValue "the request has no dsl field")
-      Just dsl -> case finalize (loopConfig st) dsl of
-        Left errs -> json respond status200 (object
-          [ "ok"     .= False
-          , "errors" .= errs
-          ])
-        Right msgs -> json respond status200 (object
-          [ "ok"       .= True
-          , "messages" .= msgs
-          , "preview"  .= previewValue (asVocab st) dsl
-          ])
+      Just dsl -> do
+        (fresh, _) <- refreshVocab st
+        case finalize (loopConfigWith st fresh Nothing) dsl of
+          Left errs -> json respond status200 (object
+            [ "ok"     .= False
+            , "errors" .= errs
+            ])
+          Right msgs -> json respond status200 (object
+            [ "ok"       .= True
+            , "messages" .= msgs
+            , "preview"  .= previewValue fresh dsl
+            ])
 
 handleSave :: AppState -> Request -> Respond -> IO ResponseReceived
 handleSave st req respond = do
@@ -220,25 +265,27 @@ handleSave st req respond = do
       (Just dsl, Just pathText) ->
         case safePath pathText of
           Left err -> json respond status400 (failValue err)
-          Right path -> case finalize (loopConfig st) dsl of
+          Right path -> do
+            (fresh, _) <- refreshVocab st
             -- Re-validate before touching the filesystem: the operator may
             -- have edited the DSL in the browser.
-            Left errs -> json respond status200 (object
-              [ "ok"     .= False
-              , "errors" .= errs
-              ])
-            Right _ -> do
-              r <- try (BL.writeFile path
-                          (BL.fromStrict (TE.encodeUtf8 dsl) <> "\n"))
-                     :: IO (Either SomeException ())
-              case r of
-                Left e -> json respond status500
-                            (failValue ("could not write " ++ T.unpack pathText
-                                          ++ ": " ++ show e))
-                Right () -> json respond status200 (object
-                  [ "ok"   .= True
-                  , "path" .= pathText
-                  ])
+            case finalize (loopConfig st fresh) dsl of
+              Left errs -> json respond status200 (object
+                [ "ok"     .= False
+                , "errors" .= errs
+                ])
+              Right _ -> do
+                r <- try (BL.writeFile path
+                            (BL.fromStrict (TE.encodeUtf8 dsl) <> "\n"))
+                       :: IO (Either SomeException ())
+                case r of
+                  Left e -> json respond status500
+                              (failValue ("could not write " ++ T.unpack pathText
+                                            ++ ": " ++ show e))
+                  Right () -> json respond status200 (object
+                    [ "ok"   .= True
+                    , "path" .= pathText
+                    ])
       _ -> json respond status400
              (failValue "the request needs both dsl and path")
 
@@ -331,8 +378,12 @@ capTurns msgs
 -- Helpers
 -- ---------------------------------------------------------------------------
 
-loopConfig :: AppState -> LoopConfig
-loopConfig st = loopConfigWith st (asVocab st) Nothing
+-- | The loop configuration for the whole map, with no robot chosen.
+--
+-- The vocabulary is passed in rather than read from the state, because the map
+-- is re-read per request; see 'refreshVocab'.
+loopConfig :: AppState -> Vocabulary -> LoopConfig
+loopConfig st v = loopConfigWith st v Nothing
 
 -- | The loop configuration for one request.
 --

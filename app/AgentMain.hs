@@ -97,9 +97,16 @@ run opts = do
         Nothing -> Nothing
         Just url -> Just (FleetConfig url gwToken)
 
+  -- The map is no longer fetched here. It used to be, which meant an agent
+  -- started before the gateway came up died on the spot — and once it was
+  -- running, a gateway that only appeared later was never noticed. The map is
+  -- now re-read on each request; see Server.refreshVocab. So this is only the
+  -- fallback for --map, and a fleet that is not up yet is not fatal.
   vocabR <- case fleet of
     Nothing -> loadVocabulary (optMap opts)
-    Just fc -> fmap (fmap vocabularyFrom) (fetchMap mgr fc)
+    Just _  -> pure (Right emptyVocabulary)
+  -- A bad --map is still fatal: the operator named a file, so there is nothing
+  -- to fall back on and nothing would be re-read later.
   vocab <- case vocabR of
     Left err -> die err
     Right v  -> pure v
