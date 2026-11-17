@@ -14,3 +14,8 @@ out/
 # Swift voice helper build output (rebuild with tools/stt/build.sh)
 tools/stt/stt
 /.stepcode/plans
+
+# Browser test dependencies (npm install). The web UI itself has no build
+# step and no dependencies: these are only for driving it in a real browser.
+node_modules/
+package-lock.json

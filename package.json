@@ -1,0 +1,12 @@
+{
+  "name": "robotdsl-browser-tests",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser checks for the agent's web UI. Not part of the Haskell build: the library, CLI and agent are built by cabal alone, and this exists so the map and panels can be exercised in a real browser.",
+  "scripts": {
+    "test:browser": "node tools/browser-test.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.65.1"
+  }
+}
