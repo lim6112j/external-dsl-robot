@@ -31,7 +31,7 @@ full `zoneType` vocabulary (`BLOCKED`, `LINE_GUIDED`, `RELEASE`,
 
 ```bash
 cabal build          # library, CLI and the agent
-cabal test           # 70 tests
+cabal test           # 100 tests
 ```
 
 Requires GHC 9.10 (developed against 9.10.3) and cabal. The core DSL depends on
@@ -389,14 +389,39 @@ live in `Validate.hs` and run first.
 cabal test
 ```
 
-41 tests across three groups: parsing (including that `speed` and `speed_limit`
+100 tests across groups for parsing (including that `speed` and `speed_limit`
 do not collide, and that every `zoneType` parses), emitting (sequenceId parity,
 actionId uniqueness and stability, headerId allocation, `mapId` inheritance,
-the `priorityFactor` key), and schema validation (every example round-trips
+the `priorityFactor` key), schema validation (every example round-trips
 through the real schemas, plus negative cases that prove the validator actually
 rejects: too few vertices, a missing required property, an out-of-range number,
 a `SPEED_LIMIT` zone with no `maximumSpeed`, an instant action with
-`blockingType: "HARD"`, and an ill-formed timestamp).
+`blockingType: "HARD"`, and an ill-formed timestamp), the fleet client, the
+map preview, the generate-parse-validate-retry loop, and the agent's HTTP
+surface.
+
+### Browser tests
+
+The agent's web UI is covered separately, because the questions it answers —
+does a label land on another node, is anything clipped once a real font has
+measured it, does a generated mission reach the map as a drawn route — need a
+browser that can measure and click.
+
+```bash
+npm install                 # once; playwright is a devDependency
+npx playwright install chromium   # once; downloads the browser
+
+cabal run robotdsl-agent -- --port 8790 --fleet http://127.0.0.1:8080
+node tools/browser-test.js
+```
+
+Playwright is not part of the Haskell build: the library, the CLI and the
+agent are built by cabal alone, so a JS dependency cannot break them.
+`node_modules` and the lockfile are ignored.
+
+Fleet-dependent checks are skipped rather than failed when no `--fleet` is
+given, because the map alone is a supported way to run. The end-to-end check
+spends a real LLM call, so it needs `OPENROUTER_API_KEY`.
 
 ## Licence
 
