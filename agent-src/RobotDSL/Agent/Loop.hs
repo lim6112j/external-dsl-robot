@@ -21,6 +21,7 @@ module RobotDSL.Agent.Loop
   ( LoopResult(..)
   , LoopConfig(..)
   , runLoop
+  , parseValidate
   , finalize
   , mapRejects
   , inject
@@ -178,19 +179,26 @@ mapRejects voc src = case previewSource voc src of
   Left _    -> []
   Right pv  -> pvUnplaced pv
 
--- | Parse, validate, inject and emit.
+-- | Parse, inject and validate. Injection happens between parsing and
+-- validation so that the injected declarations are themselves checked.
 --
--- Injection happens between parsing and validation so that the injected
--- declarations are themselves checked.
+-- Shared with dispatch: the mission that reaches a robot must have passed the
+-- same gate as the mission shown in the browser.
+parseValidate :: LoopConfig -> Text -> Either [Text] Program
+parseValidate cfg dsl = do
+  prog0 <- case parseProgram "<agent>" dsl of
+    Left (ParseError msg) -> Left [msg]
+    Right p -> Right p
+  let prog = inject cfg prog0
+  case validate prog of
+    [] -> Right prog
+    issues -> Left (map renderIssue issues)
+
+-- | Parse, validate, inject and emit.
 finalize :: LoopConfig -> Text -> Either [Text] [Value]
 finalize cfg dsl =
-  case parseProgram "<agent>" dsl of
-    Left (ParseError msg) -> Left [msg]
-    Right prog0 -> do
-      let prog = inject cfg prog0
-      case validate prog of
-        [] -> Right (map emValue (emit prog (lcEmit cfg)))
-        issues -> Left (map renderIssue issues)
+  fmap (\prog -> map emValue (emit prog (lcEmit cfg)))
+       (parseValidate cfg dsl)
 
 -- | Fill in the declarations the model left out.
 inject :: LoopConfig -> Program -> Program
