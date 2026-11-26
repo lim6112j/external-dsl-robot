@@ -503,6 +503,9 @@ async function dispatchGo() {
     return;
   }
   const pending = dispatchPending;
+  // One-shot confirm: clear before the request, so a reflex double-click has
+  // nothing left to publish.
+  clearDispatchPending();
   setStatus("투입 중…", "busy");
   const r = await api("/api/dispatch",
     { dsl: pending.dsl, robotId: pending.robotId, dryRun: false });

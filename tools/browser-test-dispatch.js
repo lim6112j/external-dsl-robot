@@ -118,8 +118,12 @@ const dispatched = [];
     /order-test/.test(await page.textContent("#dispatch-preview")));
 
   await page.click("#dispatch-go");
+  // A reflex double-click must not produce a second publish attempt.
+  await page.evaluate(() => document.querySelector("#dispatch-go").click());
   await page.waitForFunction(() => /발행|published/.test(
     document.querySelector("#status").textContent));
+  check("a second confirm click sends nothing", dispatched.length === 2,
+    `${dispatched.length} request(s)`);
   check("confirm publishes", dispatched.length === 2 && dispatched[1].dryRun === false,
     JSON.stringify(dispatched[1]));
   check("the gateway result is reported",
