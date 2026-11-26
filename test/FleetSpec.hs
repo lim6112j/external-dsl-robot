@@ -8,10 +8,12 @@
 -- mistaken for an empty fleet.
 module FleetSpec (tests) where
 
+import Control.Exception (evaluate)
 import Data.Aeson (Value(..), encode, object, (.=))
 import qualified Data.Aeson
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KM
+import qualified Data.ByteString.Lazy as BL
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -202,6 +204,11 @@ postGatewayApp writes st req respond =
   case pathInfo req of
     ["api", "orders"] -> do
       raw <- lazyRequestBody req
+      -- lazyRequestBody may hand back an unevaluated lazy ByteString. Force
+      -- it while the request body is still available: Warp can drop the
+      -- chunks once the response is sent, leaving later decoding to read an
+      -- empty body.
+      _ <- evaluate (BL.length raw)
       let seen = SeenPost
             { spMethod = TE.decodeUtf8 (requestMethod req)
             , spBody = either (const Null) id (Data.Aeson.eitherDecode raw)
