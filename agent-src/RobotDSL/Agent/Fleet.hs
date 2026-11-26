@@ -10,6 +10,7 @@ module RobotDSL.Agent.Fleet
   , RobotRef(..)
   , fetchMap
   , fetchRobots
+  , postJson
   ) where
 
 import Control.Exception (SomeException, try)
@@ -25,8 +26,9 @@ import qualified Data.Vector as V
 
 import Network.HTTP.Client (Manager, httpLbs, parseRequest, responseBody,
                             responseStatus)
-import Network.HTTP.Simple (setRequestHeader, setRequestMethod)
-import Network.HTTP.Types (hAuthorization, statusCode)
+import Network.HTTP.Simple (setRequestBodyLBS, setRequestHeader,
+                            setRequestMethod)
+import Network.HTTP.Types (hAuthorization, hContentType, statusCode)
 
 -- | Where the gateway lives and how to authenticate against it.
 data FleetConfig = FleetConfig
@@ -73,21 +75,38 @@ fetchRobots mgr cfg = do
       Just other -> Left ("unexpected robots shape: " ++ show other)
       Nothing -> Left ("response had no robots array: " ++ show v)
 
+-- | @POST@ a JSON value to a gateway path and decode its answer.
+--
+-- The same bearer token and the same readable failures as the reads: a
+-- gateway that refuses a mission must say why, not throw an exception at the
+-- operator.
+postJson :: Manager -> FleetConfig -> Text -> Value -> IO (Either String Value)
+postJson mgr cfg path body =
+  guarded (issueWith "POST" (Just body) mgr cfg path)
+
 getJson :: Manager -> FleetConfig -> Text -> IO (Either String Value)
-getJson mgr cfg path = do
-  r <- try (issue mgr cfg path) :: IO (Either SomeException (Either String Value))
+getJson mgr cfg path = guarded (issueWith "GET" Nothing mgr cfg path)
+
+guarded :: IO (Either String Value) -> IO (Either String Value)
+guarded action = do
+  r <- try action :: IO (Either SomeException (Either String Value))
   pure $ case r of
     Left e -> Left ("could not reach the fleet gateway: " ++ show e)
     Right ok -> ok
 
-issue :: Manager -> FleetConfig -> Text -> IO (Either String Value)
-issue mgr cfg path = do
+issueWith :: Text -> Maybe Value -> Manager -> FleetConfig -> Text
+          -> IO (Either String Value)
+issueWith method body mgr cfg path = do
   req0 <- parseRequest (T.unpack (base cfg) ++ T.unpack path)
-  let req = case fcToken cfg of
-              Nothing -> setRequestMethod "GET" req0
-              Just t -> setRequestMethod "GET"
-                      $ setRequestHeader hAuthorization
-                          [TE.encodeUtf8 ("Bearer " <> t)] req0
+  let authed = case fcToken cfg of
+                Nothing -> req0
+                Just t -> setRequestHeader hAuthorization
+                            [TE.encodeUtf8 ("Bearer " <> t)] req0
+      withMethod = setRequestMethod (TE.encodeUtf8 method) authed
+      req = case body of
+              Nothing -> withMethod
+              Just v -> setRequestHeader hContentType ["application/json"]
+                      $ setRequestBodyLBS (Data.Aeson.encode v) withMethod
   resp <- httpLbs req mgr
   let code = statusCode (responseStatus resp)
   if code /= 200

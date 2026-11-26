@@ -9,6 +9,7 @@
 module FleetSpec (tests) where
 
 import Data.Aeson (Value(..), encode, object, (.=))
+import qualified Data.Aeson
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KM
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
@@ -18,9 +19,9 @@ import qualified Data.Text.Encoding as TE
 
 import Network.HTTP.Client (Manager, defaultManagerSettings, newManager)
 import Network.HTTP.Types (Status, hAuthorization, hContentType, status200,
-                            status404)
-import Network.Wai (Application, Request, pathInfo, requestHeaders,
-                    responseLBS)
+                            status400, status404)
+import Network.Wai (Application, Request, lazyRequestBody, pathInfo,
+                    requestHeaders, requestMethod, responseLBS)
 import Network.Wai.Handler.Warp (testWithApplication)
 
 import RobotDSL.Agent.Fleet
@@ -29,7 +30,7 @@ import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 
 tests :: IO [TestTree]
-tests = pure [testGroup "fleet" fleetTests]
+tests = pure [testGroup "fleet" (fleetTests ++ postTests)]
 
 fleetTests :: [TestTree]
 fleetTests =
@@ -101,6 +102,40 @@ fleetTests =
         Right rs -> assertFailure ("expected a refusal, got " ++ show rs)
   ]
 
+postTests :: [TestTree]
+postTests =
+  [ testCase "a POST sends the exact JSON body" $
+      withPostGateway $ \mgr cfg writes -> do
+        let body = object ["orderId" .= ("order-test" :: Text)]
+        r <- postJson mgr cfg "/api/orders" body
+        case r of
+          Left e -> assertFailure e
+          Right v -> assertEqual "published" (Just "published") (strOf v "status")
+        ws <- readIORef writes
+        assertEqual "one order posted" 1 (length ws)
+        let seen = head ws
+        assertEqual "POST" "POST" (spMethod seen)
+        assertEqual "body" body (spBody seen)
+        assertBool "JSON content type"
+          (any (T.isInfixOf "application/json") (spContentType seen))
+
+  , testCase "the bearer token is sent on a POST too" $
+      withPostGateway $ \mgr cfg writes -> do
+        _ <- postJson mgr cfg { fcToken = Just "s3cret" } "/api/orders"
+               (object ["orderId" .= ("o" :: Text)])
+        ws <- readIORef writes
+        assertEqual "one bearer" ["Bearer s3cret"] (spAuth (head ws))
+
+  , testCase "a refused POST reports the status and the gateway reason" $
+      withPostGatewayAt status400 $ \mgr cfg _ -> do
+        r <- postJson mgr cfg "/api/orders" (object ["orderId" .= ("o" :: Text)])
+        case r of
+          Left e -> do
+            assertBool ("status in reason: " ++ e) ("400" `T.isInfixOf` T.pack e)
+            assertBool ("body in reason: " ++ e) ("gateway refused it" `T.isInfixOf` T.pack e)
+          Right _ -> assertFailure "expected a refusal"
+  ]
+
 -- ---------------------------------------------------------------------------
 -- Stub gateway
 -- ---------------------------------------------------------------------------
@@ -142,6 +177,45 @@ recordAuth log req = atomicModifyIORef' log (\l -> (l ++ auths, ()))
   where
     auths = [ TE.decodeUtf8 v
             | (h, v) <- requestHeaders req, h == hAuthorization ]
+
+-- | What the gateway recorder saw on one write.
+data SeenPost = SeenPost
+  { spMethod      :: !Text
+  , spBody        :: !Value
+  , spAuth        :: ![Text]
+  , spContentType :: ![Text]
+  } deriving (Eq, Show)
+
+withPostGateway :: (Manager -> FleetConfig -> IORef [SeenPost] -> IO ()) -> IO ()
+withPostGateway = withPostGatewayAt status200
+
+withPostGatewayAt :: Status -> (Manager -> FleetConfig -> IORef [SeenPost] -> IO ()) -> IO ()
+withPostGatewayAt st f = do
+  writes <- newIORef []
+  testWithApplication (pure (postGatewayApp writes st)) $ \port -> do
+    mgr <- newManager defaultManagerSettings
+    let base = T.pack ("http://127.0.0.1:" ++ show port)
+    f mgr (FleetConfig base Nothing) writes
+
+postGatewayApp :: IORef [SeenPost] -> Status -> Application
+postGatewayApp writes st req respond =
+  case pathInfo req of
+    ["api", "orders"] -> do
+      raw <- lazyRequestBody req
+      let seen = SeenPost
+            { spMethod = TE.decodeUtf8 (requestMethod req)
+            , spBody = either (const Null) id (Data.Aeson.eitherDecode raw)
+            , spAuth = [ TE.decodeUtf8 v
+                       | (h, v) <- requestHeaders req, h == hAuthorization ]
+            , spContentType = [ TE.decodeUtf8 v
+                              | (h, v) <- requestHeaders req, h == hContentType ]
+            }
+      atomicModifyIORef' writes (\ws -> (ws ++ [seen], ()))
+      respond (responseLBS st [(hContentType, "application/json")]
+        (if st == status200
+           then encode (object ["status" .= ("published" :: Text)])
+           else "gateway refused it"))
+    _ -> respond (responseLBS status404 [] "")
 
 -- | The map the stub serves: one node, one edge, so counts are unambiguous.
 mapJson :: Value
