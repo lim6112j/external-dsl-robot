@@ -5,20 +5,28 @@
 -- for the HTTP half of dispatch lives in this module from Task 3 onward.
 module DispatchSpec (tests) where
 
-import Data.Aeson (Value(..), object, (.=))
+import Control.Exception (evaluate)
+import Data.Aeson (Value(..), encode, object, (.=))
+import qualified Data.Aeson
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KM
+import qualified Data.ByteString.Lazy as BL
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 
-import Network.HTTP.Client (defaultManagerSettings, newManager)
+import Network.HTTP.Client (Manager, defaultManagerSettings, newManager)
+import Network.HTTP.Types (Status, hContentType, status200, status400, status404)
+import Network.Wai (Application, lazyRequestBody, pathInfo, requestMethod,
+                    responseLBS)
+import Network.Wai.Handler.Warp (testWithApplication)
 import qualified Data.Vector as V
 
 import RobotDSL.Agent.Client (ClientConfig(..))
 import RobotDSL.Agent.Context (Vocabulary(..))
 import RobotDSL.Agent.Dispatch
-import RobotDSL.Agent.Fleet (RobotRef(..))
+import RobotDSL.Agent.Fleet (FleetConfig(..), RobotRef(..))
 import RobotDSL.Agent.Loop (LoopConfig(..))
 import RobotDSL.AST (ActionValue(..))
 import RobotDSL.Emit (EmitContext(..))
@@ -28,7 +36,8 @@ import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, assertFailure, testCase)
 
 tests :: IO [TestTree]
-tests = pure [testGroup "dispatch" (planTests ++ valueTests)]
+tests = pure [testGroup "dispatch"
+               (planTests ++ valueTests ++ ioTests)]
 
 planTests :: [TestTree]
 planTests =
@@ -230,3 +239,198 @@ arrField :: Value -> Text -> [Value]
 arrField v k = case objField v k of
   Just (Array a) -> foldr (:) [] a
   _ -> []
+
+-- ---------------------------------------------------------------------------
+-- Dispatch IO: robot check, duplicates, dry run, publish
+-- ---------------------------------------------------------------------------
+
+ioTests :: [TestTree]
+ioTests =
+  [ testCase "a dry run echoes the request and writes nothing" $
+      withDispatchGateway status200 onlineRobots $ \mgr fleet calls -> do
+        (cfg, _) <- mkDispatchCfg mgr fleet True
+        r <- dispatchOrder cfg mission True
+        case r of
+          Left errs -> assertFailure ("unexpected rejection: " ++ show errs)
+          Right (resp, dry) -> do
+            assertEqual "dry run" True dry
+            assertEqual "no dry-run flag in response" (Just True) (boolField resp "dryRun")
+            let req = objField resp "request"
+            assertEqual "orderId echoed" (Just "order-test") (req >>= (`strField` "orderId"))
+        cs <- readIORef calls
+        assertEqual "zero posts" 0 (length cs)
+
+  , testCase "without --allow-dispatch a requested publish is still dry" $
+      withDispatchGateway status200 onlineRobots $ \mgr fleet calls -> do
+        (cfg, _) <- mkDispatchCfg mgr fleet False
+        r <- dispatchOrder cfg mission False
+        case r of
+          Left errs -> assertFailure ("unexpected rejection: " ++ show errs)
+          Right (_, dry) -> assertEqual "forced dry run" True dry
+        cs <- readIORef calls
+        assertEqual "zero posts" 0 (length cs)
+
+  , testCase "an allowed publish posts the planned body once" $
+      withDispatchGateway status200 onlineRobots $ \mgr fleet calls -> do
+        (cfg, seen) <- mkDispatchCfg mgr fleet True
+        r <- dispatchOrder cfg mission False
+        case r of
+          Left errs -> assertFailure ("unexpected rejection: " ++ show errs)
+          Right (resp, dry) -> do
+            assertEqual "not dry" False dry
+            assertEqual "gateway status" (Just "published")
+              (objField resp "gateway" >>= (`strField` "status"))
+        cs <- readIORef calls
+        assertEqual "one post" 1 (length cs)
+        assertEqual "orders path" "/api/orders" (scPath (head cs))
+        expected <- doRequest <$> planned mission
+        assertEqual "body equals the plan" expected (scBody (head cs))
+        ids <- readIORef seen
+        assertEqual "order id remembered" ["order-test"] ids
+
+  , testCase "a second publish of the same order id is refused" $
+      withDispatchGateway status200 onlineRobots $ \mgr fleet calls -> do
+        (cfg, _) <- mkDispatchCfg mgr fleet True
+        _ <- dispatchOrder cfg mission False
+        second <- dispatchOrder cfg mission False
+        case second of
+          Left errs -> do
+            assertBool "duplicate named" (any ("duplicate" `T.isInfixOf`) errs)
+            assertBool "order id named" (any ("order-test" `T.isInfixOf`) errs)
+          Right _ -> assertFailure "a duplicate order id was published"
+        cs <- readIORef calls
+        assertEqual "still one post" 1 (length cs)
+
+  , testCase "a gateway refusal is reported and does not burn the order id" $
+      withDispatchGateway status400 onlineRobots $ \mgr fleet calls -> do
+        (cfg, seen) <- mkDispatchCfg mgr fleet True
+        r <- dispatchOrder cfg mission False
+        case r of
+          Left errs -> assertBool ("reason: " ++ show errs)
+            (any ("gateway refused it" `T.isInfixOf`) errs)
+          Right _ -> assertFailure "a refused order was reported as published"
+        cs <- readIORef calls
+        assertEqual "one post" 1 (length cs)
+        ids <- readIORef seen
+        assertEqual "order id not remembered" [] ids
+
+  , testCase "a robot missing from the fleet is not dispatched to" $
+      withDispatchGateway status200 emptyRobots $ \mgr fleet calls -> do
+        (cfg, _) <- mkDispatchCfg mgr fleet True
+        r <- dispatchOrder cfg mission False
+        assertLeftContaining "AMR-001" r
+        cs <- readIORef calls
+        assertEqual "zero posts" 0 (length cs)
+
+  , testCase "an offline robot is not dispatched to" $
+      withDispatchGateway status200 offlineRobots $ \mgr fleet calls -> do
+        (cfg, _) <- mkDispatchCfg mgr fleet True
+        r <- dispatchOrder cfg mission False
+        assertLeftContaining "offline" r
+        cs <- readIORef calls
+        assertEqual "zero posts" 0 (length cs)
+
+  , testCase "an unreachable gateway is reported, not treated as an empty fleet" $ do
+      mgr <- newManager defaultManagerSettings
+      (cfg, _) <- mkDispatchCfg mgr (FleetConfig "http://127.0.0.1:1" Nothing) True
+      r <- dispatchOrder cfg mission False
+      assertLeftContaining "robot" r
+
+  , testCase "a DSL rejected by the plan never reaches the gateway" $
+      withDispatchGateway status200 onlineRobots $ \mgr fleet calls -> do
+        (cfg, _) <- mkDispatchCfg mgr fleet True
+        let bad = mission <> T.unlines
+              [ "zoneset \"zs\" {"
+              , "  zone \"z\" blocked { polygon (0, 0) (1, 0) (0, 1) }"
+              , "}"
+              ]
+        r <- dispatchOrder cfg bad False
+        assertLeftContaining "zone" r
+        cs <- readIORef calls
+        assertEqual "zero posts" 0 (length cs)
+
+  ]
+
+data SeenCall = SeenCall
+  { scMethod :: !Text
+  , scPath   :: !Text
+  , scBody   :: !Value
+  } deriving (Eq, Show)
+
+onlineRobots :: Value
+onlineRobots = robotsWith "ONLINE"
+
+offlineRobots :: Value
+offlineRobots = robotsWith "OFFLINE"
+
+emptyRobots :: Value
+emptyRobots = object ["robots" .= ([] :: [Value])]
+
+robotsWith :: Text -> Value
+robotsWith conn = object
+  [ "robots" .=
+      [ object
+          [ "robotId"      .= ("acme:AMR-001" :: Text)
+          , "manufacturer" .= ("acme" :: Text)
+          , "serialNumber" .= ("AMR-001" :: Text)
+          , "mapId"        .= ("plant-b" :: Text)
+          , "connection"   .= conn
+          , "driving"      .= False
+          , "orderId"      .= ("" :: Text)
+          ]
+      ]
+  ]
+
+withDispatchGateway :: Status -> Value
+                    -> (Manager -> FleetConfig -> IORef [SeenCall] -> IO ()) -> IO ()
+withDispatchGateway st robots f = do
+  calls <- newIORef []
+  testWithApplication (pure (dispatchGatewayApp st robots calls)) $ \port -> do
+    mgr <- newManager defaultManagerSettings
+    let base = T.pack ("http://127.0.0.1:" ++ show port)
+    f mgr (FleetConfig base Nothing) calls
+
+dispatchGatewayApp :: Status -> Value -> IORef [SeenCall] -> Application
+dispatchGatewayApp st robots calls req respond =
+  case (requestMethod req, pathInfo req) of
+    ("GET", ["api", "robots"]) ->
+      respond (responseLBS status200 [(hContentType, "application/json")]
+                 (encode robots))
+    ("POST", ["api", "orders"]) -> do
+      raw <- lazyRequestBody req
+      -- Warp may drop the chunks after the response; force the body here.
+      _ <- evaluate (BL.length raw)
+      let body = either (const Null) id (Data.Aeson.eitherDecode raw)
+      atomicModifyIORef' calls
+        (\cs -> (cs ++ [SeenCall "POST" "/api/orders" body], ()))
+      respond (responseLBS st [(hContentType, "application/json")]
+        (if st == status200
+           then encode (object [ "status" .= ("published" :: Text)
+                               , "orderId" .= ("order-test" :: Text)
+                               , "robotId" .= ("acme:AMR-001" :: Text)
+                               , "headerId" .= (1 :: Int)
+                               , "waypoints" .= (3 :: Int) ])
+           else encode (object [ "error" .= ("invalid_order" :: Text)
+                               , "reasons" .= (["gateway refused it"] :: [Text]) ])))
+    _ -> respond (responseLBS status404 [] "")
+
+mkDispatchCfg :: Manager -> FleetConfig -> Bool
+              -> IO (DispatchConfig, IORef [Text])
+mkDispatchCfg mgr fleet allow = do
+  c <- mkCfg
+  seen <- newIORef []
+  pure ( DispatchConfig
+           { dcLoop = c { lcManager = mgr }
+           , dcFleet = fleet
+           , dcRobot = robot
+           , dcAllowPublish = allow
+           , dcSeenOrders = seen
+           }
+       , seen )
+
+assertLeftContaining :: Text -> Either [Text] a -> IO ()
+assertLeftContaining want r = case r of
+  Left errs -> assertBool
+    ("reason should contain " ++ T.unpack want ++ ": " ++ show errs)
+    (any (want `T.isInfixOf`) errs)
+  Right _ -> assertFailure ("expected a rejection containing " ++ T.unpack want)

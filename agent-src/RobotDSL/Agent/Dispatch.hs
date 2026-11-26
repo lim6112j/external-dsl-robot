@@ -10,21 +10,25 @@
 -- preview, a plan that reaches this module is on its way to a real robot.
 module RobotDSL.Agent.Dispatch
   ( DispatchOutcome(..)
+  , DispatchConfig(..)
   , planOrder
+  , dispatchOrder
   , actionValueJSON
   , blockingTypeJSON
   ) where
 
 import Data.Aeson (Value(..), object, (.=))
 import qualified Data.Aeson.Key as Key
+import Data.IORef (IORef, modifyIORef', readIORef)
+import Data.List (find)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Vector as V
 
 import RobotDSL.AST
 import RobotDSL.Agent.Context (Vocabulary)
-import RobotDSL.Agent.Fleet (RobotRef(..))
-import RobotDSL.Agent.Loop (LoopConfig, parseValidate)
+import RobotDSL.Agent.Fleet (FleetConfig, RobotRef(..), fetchRobots, postJson)
+import RobotDSL.Agent.Loop (LoopConfig(..), parseValidate)
 import RobotDSL.Agent.Preview (Preview(..), preview)
 
 -- | A mission ready for the gateway.
@@ -71,6 +75,73 @@ planOrder voc cfg robot src = do
     ([], o : _) -> Right (DispatchOutcome
       (requestOf robot o waypoints) (ordId o))
     (_, _) -> Left reasons
+
+-- | Everything the IO half of dispatch needs. The manager and the seen-order
+-- list are shared with the rest of the agent, so two dispatch calls in one
+-- session cannot publish the same order twice.
+data DispatchConfig = DispatchConfig
+  { dcLoop         :: !LoopConfig
+  , dcFleet        :: !FleetConfig
+  , dcRobot        :: !RobotRef
+  , dcAllowPublish :: !Bool
+  -- ^ When False, a publish request is answered as a dry run. The agent has
+  -- no authentication; this is the explicit opt-in before anything moves.
+  , dcSeenOrders   :: !(IORef [Text])
+  }
+
+-- | Check the plan against the live fleet, then either dry run or publish.
+--
+-- The order matters: an invalid mission is rejected before a single read,
+-- and a robot the gateway does not know is never sent an order. A gateway
+-- that cannot be reached is a reason to stop, never an empty fleet to trust.
+dispatchOrder :: DispatchConfig -> Text -> Bool
+              -> IO (Either [Text] (Value, Bool))
+dispatchOrder cfg src dryRun =
+  case planOrder (lcVocab (dcLoop cfg)) (dcLoop cfg) (dcRobot cfg) src of
+    Left errs -> pure (Left errs)
+    Right outcome -> do
+      let mgr = lcManager (dcLoop cfg)
+          rid = rrRobotId (dcRobot cfg)
+      known <- fetchRobots mgr (dcFleet cfg)
+      case known of
+        Left e -> pure (Left ["could not check the selected robot: " <> T.pack e])
+        Right robots -> case find ((== rid) . rrRobotId) robots of
+          Nothing -> pure (Left ["robot " <> rid <> " is not in the fleet"])
+          Just r
+            | not (rrOnline r) ->
+                pure (Left ["robot " <> rid <> " is offline"])
+            | otherwise -> publishChecked mgr outcome rid
+  where
+    publishChecked mgr outcome rid = do
+      seen <- readIORef (dcSeenOrders cfg)
+      let oid = doOrderId outcome
+      if oid `elem` seen
+        then pure (Left ["duplicate orderId " <> oid
+                           <> " was already dispatched in this session"])
+        else if dryRun || not (dcAllowPublish cfg)
+          then pure (Right (dryResponse outcome, True))
+          else do
+            sent <- postJson mgr (dcFleet cfg) "/api/orders" (doRequest outcome)
+            case sent of
+              Left e -> pure (Left [T.pack e])
+              Right gatewayValue -> do
+                modifyIORef' (dcSeenOrders cfg) (++ [oid])
+                pure (Right (publishResponse outcome gatewayValue, False))
+
+dryResponse :: DispatchOutcome -> Value
+dryResponse outcome = object
+  [ "ok"      .= True
+  , "dryRun"  .= True
+  , "request" .= doRequest outcome
+  ]
+
+publishResponse :: DispatchOutcome -> Value -> Value
+publishResponse outcome gatewayValue = object
+  [ "ok"       .= True
+  , "dryRun"   .= False
+  , "request"  .= doRequest outcome
+  , "gateway"  .= gatewayValue
+  ]
 
 -- | Nodes in travel order, with the segment's release flag. Edge steps are
 -- dropped: the gateway rebuilds every edge from consecutive node ids.
