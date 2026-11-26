@@ -188,6 +188,9 @@ contextValue st sttReady robots mapErr vocab = object
   -- configured" apart from "configured but no robots answered", which are
   -- different problems with different fixes.
   , "hasFleet"      .= isJust (asFleet st)
+  -- The browser disables its dispatch button when publishing was not
+  -- explicitly enabled at startup; otherwise a click would only dry-run.
+  , "dispatchAllowed" .= asDispatchAllow st
   , "model"        .= ccModel (asClient st)
   , "manufacturer" .= ecManufacturer (asEmitCtx st)
   , "serialNumber" .= ecSerialNumber (asEmitCtx st)

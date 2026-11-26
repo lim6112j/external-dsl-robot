@@ -207,6 +207,21 @@ tests = pure
                                && objLookup "y" o /= Nothing)
                           (arrField v "nodes"))
           assertEqual "no fleet configured" 0 (length (arrField v "robots"))
+      , testCase "GET /api/context reports publishing disabled by default" $
+        withServer $ \port mgr -> do
+          v <- getJson mgr (baseUrl port <> "/api/context")
+          assertEqual "dispatchAllowed" (Just False)
+            (boolField v "dispatchAllowed")
+
+      , testCase "GET /api/context reports publishing when allowed" $
+        withStub (const goodDsl) $ \stub ->
+          testWithApplication
+            (serverAppWithAllow True Nothing (stubMgr stub) (stubCfg stub))
+            $ \port -> do
+              v <- getJson (stubMgr stub) (baseUrl port <> "/api/context")
+              assertEqual "dispatchAllowed" (Just True)
+                (boolField v "dispatchAllowed")
+
       , testCase "POST /api/command returns generated DSL" $ withServer $ \port mgr -> do
           v <- postJson mgr (baseUrl port <> "/api/command")
                  (object ["text" .= ("랙에서 컨베이어로" :: Text)
