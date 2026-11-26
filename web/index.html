@@ -53,6 +53,7 @@
       <label for="path" class="path-label">저장 경로</label>
       <input id="path" type="text" value="mission.robot" autocomplete="off">
       <button id="save">저장</button>
+      <button id="dispatch" title="먼저 dry-run으로 요청을 보여줍니다">실제 투입</button>
       <span class="grow"></span>
       <button id="reset" class="ghost">새 대화</button>
     </div>
@@ -73,6 +74,13 @@
 
     <h2>오류</h2>
     <pre id="errors" class="errors empty">없습니다</pre>
+
+    <div id="dispatch-confirm" class="row hidden">
+      <span>아래 요청을 실제 로봇에 보낼까요?</span>
+      <pre id="dispatch-preview" class="preview"></pre>
+      <button id="dispatch-go" class="primary">확인 투입</button>
+      <button id="dispatch-cancel" class="ghost">취소</button>
+    </div>
   </section>
 </main>
 

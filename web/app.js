@@ -10,6 +10,10 @@
 const sessionId =
   "s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
+// dry-run으로 확인한 요청. DSL이나 로봇이 바뀌면 반드시 비운다 — 오래된
+// 경로가 실제 로봇으로 보내지지 않게 하는のが 이 값의 유일한 목적이다.
+let dispatchPending = null;
+
 const $ = (id) => document.getElementById(id);
 
 // 화면 상태.
@@ -328,6 +332,7 @@ function renderRobots(robots, fleetError) {
         b.addEventListener("click", () => {
           state.selectedRobot =
             state.selectedRobot === r.robotId ? null : r.robotId;
+          clearDispatchPending();
           syncRobotUI();
         });
       }
@@ -370,6 +375,7 @@ async function sendCommand(text) {
   const r = await api("/api/command", body);
   if (r.ok) {
     $("dsl").value = r.dsl;
+    clearDispatchPending();
     showMessages(r.messages);
     showUnplaced(r.preview);
     showWarnings(r.preview);
@@ -414,6 +420,7 @@ async function recompile() {
   // 노드를 구역 때문에 숨기면 고칠 근거가 사라진다.
   const r = await api("/api/compile", { dsl: dsl });
   if (r.ok) {
+    clearDispatchPending();
     showMessages(r.messages);
     showUnplaced(r.preview);
     showWarnings(r.preview);
@@ -453,6 +460,68 @@ async function save() {
     showErrors(r.errors && r.errors.length ? r.errors : [r.error || "알 수 없는 오류"]);
     setStatus("저장 실패", "err");
   }
+}
+
+function clearDispatchPending() {
+  dispatchPending = null;
+  $("dispatch-confirm").classList.add("hidden");
+  $("dispatch-preview").textContent = "";
+}
+
+// 첫 클릭: 아무것도 발행하지 않고 게이트웨이에 보낼 요청을 보여준다.
+async function dispatch() {
+  const dsl = $("dsl").value;
+  if (!dsl.trim()) {
+    setStatus("투입할 DSL이 없습니다", "err");
+    return;
+  }
+  if (!state.selectedRobot) {
+    setStatus("투입할 로봇을 먼저 선택하세요", "err");
+    return;
+  }
+  clearDispatchPending();
+  setStatus("dry-run 중…", "busy");
+  const r = await api("/api/dispatch",
+    { dsl: dsl, robotId: state.selectedRobot, dryRun: true });
+  if (!r.ok || r.errors) {
+    showErrors(r.errors && r.errors.length ? r.errors
+      : [r.error || "알 수 없는 오류"]);
+    setStatus("dry-run 실패", "err");
+    return;
+  }
+  showErrors([]);
+  $("dispatch-preview").textContent = JSON.stringify(r.request, null, 2);
+  dispatchPending = { dsl: dsl, robotId: state.selectedRobot };
+  $("dispatch-confirm").classList.remove("hidden");
+  setStatus("투입 요청을 확인하세요", "ok");
+}
+
+// 두 번째 클릭: 방금 보여준 그 요청을 실제로 발행한다.
+async function dispatchGo() {
+  if (!dispatchPending) {
+    setStatus("먼저 실제 투입 으로 요청을 확인하세요", "err");
+    return;
+  }
+  const pending = dispatchPending;
+  setStatus("투입 중…", "busy");
+  const r = await api("/api/dispatch",
+    { dsl: pending.dsl, robotId: pending.robotId, dryRun: false });
+  if (!r.ok || r.errors) {
+    showErrors(r.errors && r.errors.length ? r.errors
+      : [r.error || "알 수 없는 오류"]);
+    setStatus("투입 실패", "err");
+    return;
+  }
+  showErrors([]);
+  const gw = r.gateway || {};
+  clearDispatchPending();
+  setStatus("발행됨: " + (gw.orderId || "order")
+    + (gw.headerId ? " (headerId " + gw.headerId + ")" : ""), "ok");
+}
+
+function dispatchCancel() {
+  clearDispatchPending();
+  setStatus("투입을 취소했습니다", "");
 }
 
 async function resetSession() {
@@ -497,6 +566,13 @@ async function loadContext() {
   renderRobots(c.robots, c.fleetError);
   syncRobotUI();
 
+  const canDispatch = c.dispatchAllowed !== false;
+  $("dispatch").disabled = !canDispatch;
+  $("dispatch").title = canDispatch
+    ? "먼저 dry-run으로 요청을 보여줍니다"
+    : "이 에이전트는 --allow-dispatch 없이 실행되어 실제 발행을 할 수 없습니다";
+  clearDispatchPending();
+
   if (!c.sttReady) {
     $("listen").disabled = true;
     $("listen").title = "음성 헬퍼가 빌드되지 않았습니다. tools/stt/build.sh 를 실행하세요.";
@@ -526,6 +602,10 @@ $("send").addEventListener("click", () => sendCommand($("cmd").value));
 $("listen").addEventListener("click", listen);
 $("recompile").addEventListener("click", recompile);
 $("save").addEventListener("click", save);
+$("dispatch").addEventListener("click", dispatch);
+$("dispatch-go").addEventListener("click", dispatchGo);
+$("dispatch-cancel").addEventListener("click", dispatchCancel);
+$("dsl").addEventListener("input", clearDispatchPending);
 $("reset").addEventListener("click", resetSession);
 $("scope-clear").addEventListener("click", () => {
   state.scope = new Set();
