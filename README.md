@@ -76,7 +76,7 @@ If you would rather *talk* your mission into existence, skip to
 
 ```bash
 cabal build          # library, CLI and the agent
-cabal test           # 100 tests
+cabal test           # 139 tests
 ```
 
 Requires GHC 9.10 (developed against 9.10.3) and cabal. The core DSL depends on
@@ -143,6 +143,14 @@ python3 -c 'import json; print(json.dumps({"dsl": open("mission.robot").read(), 
 
 # With --allow-dispatch, the same request plus "dryRun":false publishes.
 # The response carries the gateway's publication result.
+python3 -c 'import json; print(json.dumps({"dsl": open("mission.robot").read(), "robotId": "acme:AMR-001", "dryRun": False}))' \
+  | curl -s -X POST http://127.0.0.1:8790/api/dispatch \
+      -H 'Content-Type: application/json' -d @-
+
+# Instant actions use the same dry-run/allow-dispatch gates:
+curl -s -X POST http://127.0.0.1:8790/api/instant-actions \
+  -H 'Content-Type: application/json' \
+  -d '{"robotId":"acme:AMR-001","actions":["startPause"]}'
 ```
 
 A dispatch is rejected before any write when the DSL declares zones, edge
@@ -465,7 +473,7 @@ live in `Validate.hs` and run first.
 cabal test
 ```
 
-100 tests across groups for parsing (including that `speed` and `speed_limit`
+139 tests across groups for parsing (including that `speed` and `speed_limit`
 do not collide, and that every `zoneType` parses), emitting (sequenceId parity,
 actionId uniqueness and stability, headerId allocation, `mapId` inheritance,
 the `priorityFactor` key), schema validation (every example round-trips
@@ -473,8 +481,9 @@ through the real schemas, plus negative cases that prove the validator actually
 rejects: too few vertices, a missing required property, an out-of-range number,
 a `SPEED_LIMIT` zone with no `maximumSpeed`, an instant action with
 `blockingType: "HARD"`, and an ill-formed timestamp), the fleet client, the
-map preview, the generate-parse-validate-retry loop, and the agent's HTTP
-surface.
+map preview, the generate-parse-validate-retry loop, the agent's HTTP
+surface, order planning and rejection rules, and dry-run-first gateway dispatch
+(both orders and instant actions).
 
 ### Browser tests
 
@@ -489,6 +498,9 @@ npx playwright install chromium   # once; downloads the browser
 
 cabal run robotdsl-agent -- --port 8790 --fleet http://127.0.0.1:8080
 node tools/browser-test.js
+
+# Dispatch tests use an in-process gateway stub; no broker or robot is needed.
+# To publish for real, start the agent with --fleet and --allow-dispatch.
 ```
 
 Playwright is not part of the Haskell build: the library, the CLI and the

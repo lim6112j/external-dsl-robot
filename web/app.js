@@ -3,8 +3,8 @@
 // 서버는 모든 생성을 파싱·검증하므로, 이 UI는 잘못된 DSL을 보여주거나 저장하는
 // 법이 없다: 서버가 거부하면 오류만 표시한다.
 //
-// Phase 1 은 읽기 전용이다. 이 UI는 임무를 발행하지 않고, 맵에 어떻게
-// 진행할지만 보여준다. 투입 버튼은 Phase 2 에서 추가된다.
+// 이 UI는 임무를 발행하지 않고, 맵에 어떻게 진행할지만 보여준다. 발행은
+// API 로 한다: POST /api/dispatch (dry-run 기본) 또는 /api/instant-actions.
 
 // 브라우저 세션 동안 유지되는 대화 id. 서버가 이 id 로 대화 맥락을 이어간다.
 const sessionId =
@@ -108,7 +108,8 @@ function showUnplaced(pv) {
   el.className = "unplaced";
 }
 
-// 게이트웨이가 표현 못 하는 것. Phase 1 은 발행하지 않으므로 경고일 뿐이다.
+// 게이트웨이가 표현 못 하는 것. 여기서는 경고로 보여주지만 같은 조건은
+// /api/dispatch 에서 투입 전 거부 사유가 된다.
 function showWarnings(pv) {
   const el = $("warnings");
   const list = (pv && pv.warnings) || [];
