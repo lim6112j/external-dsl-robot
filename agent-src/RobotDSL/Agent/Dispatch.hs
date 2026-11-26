@@ -65,13 +65,17 @@ planOrder voc cfg robot src = do
         [_] -> []
         ns  -> ["this file declares " <> tshow (length ns)
                   <> " orders; dispatch needs exactly one"]
+      instantErrs =
+        [ "instant actions are not part of an order; use /api/instant-actions"
+        | DeclInstant _ <- progDecls prog
+        ]
       waypoints = case orders of
         (o : _) -> waypointsOf o
         _       -> []
       nodeErrs = if null waypoints
                    then ["the order has no nodes to dispatch"]
                    else []
-      reasons = pvErrs ++ identityErrs ++ orderErrs ++ nodeErrs
+      reasons = pvErrs ++ identityErrs ++ orderErrs ++ nodeErrs ++ instantErrs
   case (reasons, orders) of
     ([], o : _) -> Right (DispatchOutcome
       (requestOf robot o waypoints) (ordId o))

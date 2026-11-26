@@ -97,6 +97,10 @@ planTests =
       let src = T.replace "AMR-001" "AMR-999" mission
       assertRejects ["AMR-001", "AMR-999"] src
 
+  , testCase "instant actions in an order file are not silently dropped" $
+      assertRejects ["instant", "/api/instant-actions"]
+        (mission <> "instant \"pause\" { action \"startPause\" }\n")
+
   , testCase "a zone set cannot be dispatched" $
       assertRejects ["zone"] (mission <> T.unlines
         [ "zoneset \"zs\" {"

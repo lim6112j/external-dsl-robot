@@ -76,7 +76,7 @@ If you would rather *talk* your mission into existence, skip to
 
 ```bash
 cabal build          # library, CLI and the agent
-cabal test           # 139 tests
+cabal test           # 140 tests
 ```
 
 Requires GHC 9.10 (developed against 9.10.3) and cabal. The core DSL depends on
@@ -473,7 +473,7 @@ live in `Validate.hs` and run first.
 cabal test
 ```
 
-139 tests across groups for parsing (including that `speed` and `speed_limit`
+140 tests across groups for parsing (including that `speed` and `speed_limit`
 do not collide, and that every `zoneType` parses), emitting (sequenceId parity,
 actionId uniqueness and stability, headerId allocation, `mapId` inheritance,
 the `priorityFactor` key), schema validation (every example round-trips
