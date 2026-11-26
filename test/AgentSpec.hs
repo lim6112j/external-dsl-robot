@@ -283,6 +283,85 @@ tests = pure
             --  order-pallet-1 이 나오기 때문.)
             assertBool "second call carries the earlier turn"
                        (messageCount (head calls) > messageCount (last calls))
+      , testCase "POST /api/dispatch defaults to a dry run" $
+        withServerAndGateway $ \port mgr _ seen -> do
+          v <- postJson mgr (baseUrl port <> "/api/dispatch")
+                 (object ["dsl" .= goodDsl
+                         , "robotId" .= ("acme:AMR-001" :: Text)])
+          assertEqual "ok" (Just True) (boolField v "ok")
+          assertEqual "dryRun" (Just True) (boolField v "dryRun")
+          assertBool "request echoed" (maybe False (const True)
+                                          (objLookup "request" v))
+          reqs <- readIORef seen
+          assertBool "no write reached the gateway"
+            (not (any ((== "POST") . fst) reqs))
+
+      , testCase "POST /api/dispatch publishes when allowed and asked" $
+        withServerAndGatewayAllow True $ \port mgr _ seen -> do
+          v <- postJson mgr (baseUrl port <> "/api/dispatch")
+                 (object ["dsl" .= goodDsl
+                         , "robotId" .= ("acme:AMR-001" :: Text)
+                         , "dryRun" .= False])
+          assertEqual "ok" (Just True) (boolField v "ok")
+          assertEqual "not dry" (Just False) (boolField v "dryRun")
+          assertEqual "gateway status" (Just "published")
+            (objLookup "gateway" v >>= (`strFieldMaybe` "status"))
+          reqs <- readIORef seen
+          assertBool "one order posted" (("POST", "/api/orders") `elem` reqs)
+
+      , testCase "POST /api/dispatch rejects a robot the gateway does not know" $
+        withServerAndGatewayAllow True $ \port mgr _ seen -> do
+          v <- postJson mgr (baseUrl port <> "/api/dispatch")
+                 (object ["dsl" .= goodDsl
+                         , "robotId" .= ("acme:AMR-999" :: Text)
+                         , "dryRun" .= False])
+          assertEqual "not ok" (Just False) (boolField v "ok")
+          assertBool "errors given" (not (null (arrField v "errors")))
+          reqs <- readIORef seen
+          assertBool "no write reached the gateway"
+            (not (any ((== "POST") . fst) reqs))
+
+      , testCase "POST /api/dispatch needs a robotId" $
+        withServerAndGatewayAllow True $ \port mgr _ seen -> do
+          v <- postJson mgr (baseUrl port <> "/api/dispatch")
+                 (object ["dsl" .= goodDsl, "dryRun" .= False])
+          assertEqual "not ok" (Just False) (boolField v "ok")
+          reqs <- readIORef seen
+          assertBool "no write reached the gateway"
+            (not (any ((== "POST") . fst) reqs))
+
+      , testCase "POST /api/dispatch refuses a DSL the plan rejects" $
+        withServerAndGatewayAllow True $ \port mgr _ seen -> do
+          let withZone = goodDsl <> T.unlines
+                [ "zoneset \"zs\" {"
+                , "  zone \"z\" blocked { polygon (0, 0) (1, 0) (0, 1) }"
+                , "}"
+                ]
+          v <- postJson mgr (baseUrl port <> "/api/dispatch")
+                 (object ["dsl" .= withZone
+                         , "robotId" .= ("acme:AMR-001" :: Text)
+                         , "dryRun" .= False])
+          assertEqual "not ok" (Just False) (boolField v "ok")
+          assertBool "the zone is named"
+            (any (\e -> case e of
+                    String s -> "zone" `T.isInfixOf` s
+                    _ -> False) (arrField v "errors"))
+          reqs <- readIORef seen
+          assertBool "no write reached the gateway"
+            (not (any ((== "POST") . fst) reqs))
+
+      , testCase "without --allow-dispatch a publish request is still dry" $
+        withServerAndGateway $ \port mgr _ seen -> do
+          v <- postJson mgr (baseUrl port <> "/api/dispatch")
+                 (object ["dsl" .= goodDsl
+                         , "robotId" .= ("acme:AMR-001" :: Text)
+                         , "dryRun" .= False])
+          assertEqual "ok" (Just True) (boolField v "ok")
+          assertEqual "forced dry run" (Just True) (boolField v "dryRun")
+          reqs <- readIORef seen
+          assertBool "no write reached the gateway"
+            (not (any ((== "POST") . fst) reqs))
+
       , testCase "the agent never writes to the fleet gateway" $
         withServerAndGateway $ \port mgr _ seen -> do
           -- 읽기는 허용된다: 맵과 로봇을 조회한다.
@@ -571,7 +650,12 @@ serverApp = serverAppWith Nothing
 -- @fleet@ is @Nothing@ for every test that does not care, so the default
 -- stays "no gateway" rather than "some gateway".
 serverAppWith :: Maybe FleetConfig -> Manager -> ClientConfig -> IO Application
-serverAppWith fleet mgr client = serverAppWithVocab fleet mgr client testVocab
+serverAppWith = serverAppWithAllow False
+
+serverAppWithAllow :: Bool -> Maybe FleetConfig -> Manager -> ClientConfig
+                   -> IO Application
+serverAppWithAllow allow fleet mgr client =
+  serverAppWithVocabAndAllow allow fleet mgr client testVocab
 
 -- | The agent with an empty vocabulary, as if it had started before the
 -- gateway was up.
@@ -580,10 +664,15 @@ serverAppWithNoMap fleet mgr client = serverAppWithVocab fleet mgr client emptyV
 
 serverAppWithVocab
   :: Maybe FleetConfig -> Manager -> ClientConfig -> Vocabulary -> IO Application
-serverAppWithVocab fleet mgr client vocab = do
+serverAppWithVocab = serverAppWithVocabAndAllow False
+
+serverAppWithVocabAndAllow
+  :: Bool -> Maybe FleetConfig -> Manager -> ClientConfig -> Vocabulary
+  -> IO Application
+serverAppWithVocabAndAllow allow fleet mgr client vocab = do
   let emitCtx = EmitContext "acme" "AMR-001" 1 "2026-01-01T00:00:00.000Z"
                             protocolVersion (Just "plant-b")
-  st <- newAppState mgr client vocab fleet emitCtx "web" ""
+  st <- newAppState allow mgr client vocab fleet emitCtx "web" ""
   pure (app st)
 
 testVocab :: Vocabulary
@@ -611,6 +700,14 @@ gatewayRecorder seen req respond =
       atomicModifyIORef' seen (\c -> (("GET", "/api/robots") : c, ()))
       respond (responseLBS status200 [(hContentType, "application/json")]
                  (encode gatewayRobotsJson))
+    ("POST", ["api", "orders"]) -> do
+      atomicModifyIORef' seen (\c -> (("POST", "/api/orders") : c, ()))
+      respond (responseLBS status200 [(hContentType, "application/json")]
+        (encode (object [ "status" .= ("published" :: Text)
+                        , "orderId" .= ("order-test" :: Text)
+                        , "robotId" .= ("acme:AMR-001" :: Text)
+                        , "headerId" .= (1 :: Int)
+                        , "waypoints" .= (2 :: Int) ])))
     _ -> do
       let entry = ( T.unpack (TE.decodeUtf8 (requestMethod req))
                   , T.unpack (T.intercalate "/" (pathInfo req)) )
@@ -648,11 +745,16 @@ gatewayRobotsJson = object
 -- to it could not be anything but the agent's own doing.
 withServerAndGateway
   :: (Port -> Manager -> Stub -> IORef [(String, String)] -> IO ()) -> IO ()
-withServerAndGateway f = withStub (const goodDsl) $ \stub -> do
+withServerAndGateway = withServerAndGatewayAllow False
+
+withServerAndGatewayAllow
+  :: Bool
+  -> (Port -> Manager -> Stub -> IORef [(String, String)] -> IO ()) -> IO ()
+withServerAndGatewayAllow allow f = withStub (const goodDsl) $ \stub -> do
   seen <- newIORef []
   testWithApplication (pure (gatewayRecorder seen)) $ \gwPort ->
     testWithApplication
-      (serverAppWith
+      (serverAppWithAllow allow
          (Just (FleetConfig
                   (T.pack ("http://127.0.0.1:" ++ show gwPort)) Nothing))
          (stubMgr stub) (stubCfg stub))

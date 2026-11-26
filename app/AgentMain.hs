@@ -51,6 +51,8 @@ data Options = Options
   -- When given, the map and the robot list are read from it live.
   , optGwToken  :: !(Maybe Text)
   -- ^ Bearer token for the gateway, when it was started with @--api-token@.
+  , optAllowDispatch :: !Bool
+  -- ^ Required before @POST /api/dispatch@ may publish instead of dry-running.
   , optStt      :: !FilePath
   , optWebDir   :: !FilePath
   , optMfr      :: !Text
@@ -68,6 +70,7 @@ defaultOptions = Options
   , optMap     = Nothing
   , optFleet   = Nothing
   , optGwToken = Nothing
+  , optAllowDispatch = False
   , optStt     = "tools" </> "stt" </> "stt"
   , optWebDir  = "web"
   , optMfr     = "acme"
@@ -135,7 +138,8 @@ run opts = do
         , ccMaxTokens = optMaxTok opts
         }
 
-  st <- newAppState mgr client vocab fleet ctx (optWebDir opts) (optStt opts)
+  st <- newAppState (optAllowDispatch opts) mgr client vocab fleet ctx
+                    (optWebDir opts) (optStt opts)
   ready <- doesFileExist (optStt opts)
 
   hPutStrLn stderr $ "robotdsl-agent listening on http://" ++ optHost opts
@@ -146,6 +150,9 @@ run opts = do
   hPutStrLn stderr $ "  voice:      " ++ (if ready
                                             then "ready"
                                             else "not built (run tools/stt/build.sh)")
+  hPutStrLn stderr $ "  dispatch:   " ++ (if optAllowDispatch opts
+                                            then "publishing allowed"
+                                            else "dry run only (--allow-dispatch to publish)")
 
   runSettings (setFdCacheDuration 3600
                $ setHost (fromString (optHost opts))
@@ -174,6 +181,7 @@ parseArgs = go defaultOptions
       "--map"           -> need as $ \v as' -> go (o { optMap = Just v }) as'
       "--fleet"         -> need as $ \v as' -> go (o { optFleet = Just (T.pack v) }) as'
       "--gateway-token" -> need as $ \v as' -> go (o { optGwToken = Just (T.pack v) }) as'
+      "--allow-dispatch" -> go (o { optAllowDispatch = True }) as
       "--stt"           -> need as $ \v as' -> go (o { optStt = v }) as'
       "--web-dir"       -> need as $ \v as' -> go (o { optWebDir = v }) as'
       "--manufacturer"  -> need as $ \v as' -> go (o { optMfr = T.pack v }) as'
@@ -215,6 +223,8 @@ usage = unlines
   , "                        robot list live, which beats --map."
   , "  --gateway-token K    bearer token for the gateway (default:"
   , "                        $ROBOT_GATEWAY_TOKEN)"
+  , "  --allow-dispatch     let POST /api/dispatch publish orders;"
+  , "                        without it every dispatch is a dry run"
   , "  --stt PATH           voice helper binary (default tools/stt/stt)"
   , "  --web-dir DIR        where index.html lives (default web)"
   , "  --manufacturer M     manufacturer for emitted messages"

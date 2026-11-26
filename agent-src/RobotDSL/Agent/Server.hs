@@ -42,6 +42,7 @@ import Network.Wai (Application, Request, Response, ResponseReceived,
 
 import RobotDSL.Agent.Client
 import RobotDSL.Agent.Context
+import RobotDSL.Agent.Dispatch (DispatchConfig(..), dispatchOrder)
 import RobotDSL.Agent.Fleet
 import RobotDSL.Agent.Loop
 import RobotDSL.Agent.Preview
@@ -68,13 +69,31 @@ data AppState = AppState
   -- ^ Conversation history per browser session, oldest first.
   , asWebDir    :: !FilePath
   , asSttPath   :: !FilePath
+  , asDispatchAllow :: !Bool
+  -- ^ Whether a request may actually publish. Off by default: the agent has
+  -- no authentication, so dispatching is an explicit startup decision.
+  , asSeenOrders :: !(IORef [Text])
+  -- ^ Order ids published in this session, for duplicate detection.
   }
 
-newAppState :: Manager -> ClientConfig -> Vocabulary -> Maybe FleetConfig
+newAppState :: Bool -> Manager -> ClientConfig -> Vocabulary -> Maybe FleetConfig
             -> EmitContext -> FilePath -> FilePath -> IO AppState
-newAppState mgr cli vocab fleet emitCtx webDir sttPath =
-  AppState mgr cli <$> newIORef vocab <*> pure fleet <*> pure emitCtx
-          <*> newIORef [] <*> pure webDir <*> pure sttPath
+newAppState allow mgr cli vocab fleet emitCtx webDir sttPath = do
+  vocabRef <- newIORef vocab
+  sessions <- newIORef []
+  seen <- newIORef []
+  pure AppState
+    { asManager = mgr
+    , asClient = cli
+    , asVocab = vocabRef
+    , asFleet = fleet
+    , asEmitCtx = emitCtx
+    , asSessions = sessions
+    , asWebDir = webDir
+    , asSttPath = sttPath
+    , asDispatchAllow = allow
+    , asSeenOrders = seen
+    }
 
 app :: AppState -> Application
 app st req respond =
@@ -87,6 +106,7 @@ app st req respond =
     ("POST", ["api", "command"]) -> handleCommand st req respond
     ("POST", ["api", "listen"])  -> handleListen st req respond
     ("POST", ["api", "compile"]) -> handleCompile st req respond
+    ("POST", ["api", "dispatch"]) -> handleDispatch st req respond
     ("POST", ["api", "save"])    -> handleSave st req respond
     ("POST", ["api", "reset"])   -> handleReset st req respond
 
@@ -255,6 +275,47 @@ handleCompile st req respond = do
             , "preview"  .= previewValue fresh dsl
             ])
 
+-- | Turn edited or generated DSL into a gateway order.
+--
+-- Publishing is opt-in twice: the request must ask for it (dry run is the
+-- default) and the agent must have been started with @--allow-dispatch@.
+-- Every rejection is answered the same way as compile/save failures.
+handleDispatch :: AppState -> Request -> Respond -> IO ResponseReceived
+handleDispatch st req respond = do
+  body <- lazyRequestBody req
+  case Data.Aeson.eitherDecode body of
+    Left err -> json respond status400
+                  (failValue ("could not parse the request: " ++ err))
+    Right v -> case (field "dsl" v, field "robotId" v) of
+      (Just dsl, Just rid) -> do
+        let dryRun = fromMaybe True (fieldBool "dryRun" v)
+        robot <- resolveRobot st (Just rid)
+        case (robot, asFleet st) of
+          (Nothing, _) -> json respond status200 (object
+            [ "ok" .= False
+            , "errors" .= ["robot " <> rid <> " is not in the fleet"]
+            ])
+          (Just _, Nothing) -> json respond status200 (object
+            [ "ok" .= False
+            , "errors" .= (["no fleet gateway is configured"] :: [Text])
+            ])
+          (Just r, Just fleetCfg) -> do
+            (fresh, _) <- refreshVocab st
+            let cfg = DispatchConfig
+                  { dcLoop = loopConfigWith st fresh Nothing
+                  , dcFleet = fleetCfg
+                  , dcRobot = r
+                  , dcAllowPublish = asDispatchAllow st
+                  , dcSeenOrders = asSeenOrders st
+                  }
+            res <- dispatchOrder cfg dsl dryRun
+            case res of
+              Left errs -> json respond status200 (object
+                [ "ok" .= False, "errors" .= errs ])
+              Right (answer, _) -> json respond status200 answer
+      _ -> json respond status400
+             (failValue "the request needs both dsl and robotId")
+
 handleSave :: AppState -> Request -> Respond -> IO ResponseReceived
 handleSave st req respond = do
   body <- lazyRequestBody req
@@ -406,6 +467,12 @@ field k (Object o) = case KM.lookup (Key.fromText k) o of
   Just (String s) -> Just s
   _               -> Nothing
 field _ _ = Nothing
+
+fieldBool :: Text -> Value -> Maybe Bool
+fieldBool k (Object o) = case KM.lookup (Key.fromText k) o of
+  Just (Bool b) -> Just b
+  _             -> Nothing
+fieldBool _ _ = Nothing
 
 -- | A list of strings from a JSON array field.
 fieldList :: Text -> Value -> Maybe [Text]

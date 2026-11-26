@@ -27,6 +27,51 @@ full `zoneType` vocabulary (`BLOCKED`, `LINE_GUIDED`, `RELEASE`,
 
 ---
 
+## Quick start (how to use)
+
+The shortest useful path, from zero to a wire-ready VDA 5050 message:
+
+```bash
+# 0. build
+mkdir -p ~/.local/bin
+cabal install exe:robotdsl --installdir ~/.local/bin --overwrite-policy=always
+export PATH="$HOME/.local/bin:$PATH"
+
+# 1. try an example
+robotdsl check examples/palletizing.robot
+
+# 2. look at what one produces
+robotdsl compile examples/palletizing.robot | less
+
+# 3. write your own mission
+cp examples/palletizing.robot my-mission.robot
+$EDITOR my-mission.robot
+
+# 4. compile it to JSON files (one per message, with the MQTT topic echoed)
+robotdsl compile my-mission.robot --out out/
+```
+
+A typical workflow from there:
+
+1. **Check** while editing — `robotdsl check my-mission.robot` gives parse and
+   semantic errors with line and column, and never touches the filesystem.
+2. **Compile** — `robotdsl compile my-mission.robot --out out/` also validates
+   every message against the official v3.0.0 schemas and writes one JSON file
+   per message, echoing the MQTT topic it belongs on
+   (e.g. `vda5050/v3/acme/AMR-001/order`). Exit code 0 only when everything
+   passed.
+3. **Publish** — the echoed topics are the wire format, so `out/*.json` can be
+   piped straight into your MQTT publisher.
+4. **Cross-check** — `python3 tools/verify-output.py out/` re-validates the
+   output with an independent Python implementation (274 checks).
+
+Two gotchas on a first run: run `compile` from the project root (or pass
+`--schema-dir "$PWD/schemas/vda5050/3.0.0"`), and note the directory is
+`examples`, plural. See [Troubleshooting](#troubleshooting).
+
+If you would rather *talk* your mission into existence, skip to
+[AI agent interface](#ai-agent-interface).
+
 ## Build
 
 ```bash
@@ -55,10 +100,14 @@ types or speaks a request in Korean; a model on OpenRouter turns it into
 robotdsl source; the existing parser and validator then decide whether that
 source is acceptable.
 
-The model is only ever a translator. Nothing reaches the operator, and nothing
-is written to disk, unless `RobotDSL.Parser` and `RobotDSL.Validate` both
-accept the output. When they reject it, the exact error is fed back for another
-attempt, up to three times.
+The model is only ever a translator. Nothing reaches the operator, nothing is
+written to disk, and no mission is published, unless `RobotDSL.Parser` and
+`RobotDSL.Validate` both accept the output. When they reject it, the exact
+error is fed back for another attempt, up to three times.
+
+Publishing is a separate, explicit step: `/api/dispatch` dry-runs by default,
+and even a request with `"dryRun":false` only publishes when the agent was
+started with `--allow-dispatch`.
 
 ```bash
 # build the voice helper once (macOS Speech framework, on-device)
@@ -73,13 +122,40 @@ cabal run robotdsl-agent -- --map ../로봇관제시스템/deploy/maps/plant-b.l
 | `POST /api/command` | generate DSL from text, on a session |
 | `POST /api/listen` | transcribe one utterance via the Swift helper |
 | `POST /api/compile` | recompile DSL edited in the browser |
+| `POST /api/dispatch` | build a gateway order from the DSL (dry run by default) |
+| `POST /api/instant-actions` | send pause/resume/cancel to one robot |
 | `POST /api/save` | write the file, after re-validating |
 | `POST /api/reset` | clear the conversation |
 | `GET /api/context` | vocabulary and identity in use |
 
-`--map` is the single biggest quality lever: without it the generator has no
-real node ids and will invent plausible-looking ones. The server binds to
-`127.0.0.1` by default because it has no authentication.
+### Dispatching a mission
+
+The browser UI generates and validates DSL; the API can hand a validated order
+to the fleet gateway's `POST /api/orders`. Start the agent with `--fleet` (so it
+can check the robot and the map) and add `--allow-dispatch` only when publishing
+is intended:
+
+```bash
+# See the exact OrderRequest without writing anything (default).
+python3 -c 'import json; print(json.dumps({"dsl": open("mission.robot").read(), "robotId": "acme:AMR-001"}))' \
+  | curl -s -X POST http://127.0.0.1:8790/api/dispatch \
+      -H 'Content-Type: application/json' -d @-
+
+# With --allow-dispatch, the same request plus "dryRun":false publishes.
+# The response carries the gateway's publication result.
+```
+
+A dispatch is rejected before any write when the DSL declares zones, edge
+actions or constraints, nodes or hops absent from the map, two orders, no
+route, or a robot other than the one selected. The selected robot must be
+online and known to the gateway; an `orderId` already published in this
+session is refused. `--allow-dispatch` is off by default because the agent has
+no authentication — the gateway verifies the order against its own map, but
+it does not check that the robot exists before publishing.
+
+`--map` is the single biggest quality lever for generation: without it the
+model has no real node ids and will invent plausible-looking ones. The server
+binds to `127.0.0.1` by default because it has no authentication.
 
 ## The language
 
