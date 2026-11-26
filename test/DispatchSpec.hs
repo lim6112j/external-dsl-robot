@@ -336,6 +336,46 @@ ioTests =
       r <- dispatchOrder cfg mission False
       assertLeftContaining "robot" r
 
+  , testCase "an instant action dry run writes nothing" $
+      withDispatchGateway status200 onlineRobots $ \mgr fleet calls -> do
+        (cfg, _) <- mkDispatchCfg mgr fleet True
+        r <- sendInstant cfg ["startPause"] True
+        case r of
+          Left errs -> assertFailure ("unexpected rejection: " ++ show errs)
+          Right (resp, dry) -> do
+            assertEqual "dry run" True dry
+            assertEqual "action echoed" (Just "startPause")
+              (case objField resp "request" of
+                 Just req -> case arrField req "actions" of
+                   (a : _) -> strField a "actionType"
+                   _ -> Nothing
+                 _ -> Nothing)
+        cs <- readIORef calls
+        assertEqual "zero posts" 0 (length cs)
+
+  , testCase "an allowed instant action posts to the robot route" $
+      withDispatchGateway status200 onlineRobots $ \mgr fleet calls -> do
+        (cfg, _) <- mkDispatchCfg mgr fleet True
+        r <- sendInstant cfg ["startPause", "stateRequest"] False
+        case r of
+          Left errs -> assertFailure ("unexpected rejection: " ++ show errs)
+          Right (_, dry) -> assertEqual "not dry" False dry
+        cs <- readIORef calls
+        assertEqual "one post" 1 (length cs)
+        assertEqual "robot route"
+          "/api/robots/acme:AMR-001/instant-actions" (scPath (head cs))
+        assertEqual "two actions" 2 (length (arrField (scBody (head cs)) "actions"))
+        assertEqual "first action type" (Just "startPause")
+          (strField (head (arrField (scBody (head cs)) "actions")) "actionType")
+
+  , testCase "an empty instant action list is rejected" $
+      withDispatchGateway status200 onlineRobots $ \mgr fleet calls -> do
+        (cfg, _) <- mkDispatchCfg mgr fleet True
+        r <- sendInstant cfg [] False
+        assertLeftContaining "at least one" r
+        cs <- readIORef calls
+        assertEqual "zero posts" 0 (length cs)
+
   , testCase "a DSL rejected by the plan never reaches the gateway" $
       withDispatchGateway status200 onlineRobots $ \mgr fleet calls -> do
         (cfg, _) <- mkDispatchCfg mgr fleet True
@@ -412,6 +452,17 @@ dispatchGatewayApp st robots calls req respond =
                                , "waypoints" .= (3 :: Int) ])
            else encode (object [ "error" .= ("invalid_order" :: Text)
                                , "reasons" .= (["gateway refused it"] :: [Text]) ])))
+    ("POST", ["api", "robots", rid, "instant-actions"]) -> do
+      raw <- lazyRequestBody req
+      _ <- evaluate (BL.length raw)
+      let body = either (const Null) id (Data.Aeson.eitherDecode raw)
+          path = "/api/robots/" ++ T.unpack rid ++ "/instant-actions"
+      atomicModifyIORef' calls (\cs -> (cs ++ [SeenCall "POST" (T.pack path) body], ()))
+      respond (responseLBS status200 [(hContentType, "application/json")]
+        (encode (object [ "status" .= ("published" :: Text)
+                        , "robotId" .= rid
+                        , "headerId" .= (1 :: Int)
+                        , "actions" .= (["startPause"] :: [Text]) ])))
     _ -> respond (responseLBS status404 [] "")
 
 mkDispatchCfg :: Manager -> FleetConfig -> Bool

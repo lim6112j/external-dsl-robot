@@ -362,6 +362,28 @@ tests = pure
           assertBool "no write reached the gateway"
             (not (any ((== "POST") . fst) reqs))
 
+      , testCase "POST /api/instant-actions defaults to a dry run" $
+        withServerAndGateway $ \port mgr _ seen -> do
+          v <- postJson mgr (baseUrl port <> "/api/instant-actions")
+                 (object ["robotId" .= ("acme:AMR-001" :: Text)
+                         , "actions" .= (["startPause"] :: [Text])])
+          assertEqual "ok" (Just True) (boolField v "ok")
+          assertEqual "dryRun" (Just True) (boolField v "dryRun")
+          reqs <- readIORef seen
+          assertBool "no write reached the gateway"
+            (not (any ((== "POST") . fst) reqs))
+
+      , testCase "POST /api/instant-actions rejects an unknown robot" $
+        withServerAndGatewayAllow True $ \port mgr _ seen -> do
+          v <- postJson mgr (baseUrl port <> "/api/instant-actions")
+                 (object ["robotId" .= ("acme:AMR-999" :: Text)
+                         , "actions" .= (["startPause"] :: [Text])
+                         , "dryRun" .= False])
+          assertEqual "not ok" (Just False) (boolField v "ok")
+          reqs <- readIORef seen
+          assertBool "no write reached the gateway"
+            (not (any ((== "POST") . fst) reqs))
+
       , testCase "the agent never writes to the fleet gateway" $
         withServerAndGateway $ \port mgr _ seen -> do
           -- 읽기는 허용된다: 맵과 로봇을 조회한다.
@@ -700,6 +722,14 @@ gatewayRecorder seen req respond =
       atomicModifyIORef' seen (\c -> (("GET", "/api/robots") : c, ()))
       respond (responseLBS status200 [(hContentType, "application/json")]
                  (encode gatewayRobotsJson))
+    ("POST", ["api", "robots", rid, "instant-actions"]) -> do
+      let path = "/api/robots/" ++ T.unpack rid ++ "/instant-actions"
+      atomicModifyIORef' seen (\c -> (("POST", path) : c, ()))
+      respond (responseLBS status200 [(hContentType, "application/json")]
+        (encode (object [ "status" .= ("published" :: Text)
+                        , "robotId" .= rid
+                        , "headerId" .= (1 :: Int)
+                        , "actions" .= (["startPause"] :: [Text]) ])))
     ("POST", ["api", "orders"]) -> do
       atomicModifyIORef' seen (\c -> (("POST", "/api/orders") : c, ()))
       respond (responseLBS status200 [(hContentType, "application/json")]

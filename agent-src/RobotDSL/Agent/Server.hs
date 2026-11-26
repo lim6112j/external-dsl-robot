@@ -42,7 +42,8 @@ import Network.Wai (Application, Request, Response, ResponseReceived,
 
 import RobotDSL.Agent.Client
 import RobotDSL.Agent.Context
-import RobotDSL.Agent.Dispatch (DispatchConfig(..), dispatchOrder)
+import RobotDSL.Agent.Dispatch (DispatchConfig(..), dispatchOrder,
+                                sendInstant)
 import RobotDSL.Agent.Fleet
 import RobotDSL.Agent.Loop
 import RobotDSL.Agent.Preview
@@ -107,6 +108,7 @@ app st req respond =
     ("POST", ["api", "listen"])  -> handleListen st req respond
     ("POST", ["api", "compile"]) -> handleCompile st req respond
     ("POST", ["api", "dispatch"]) -> handleDispatch st req respond
+    ("POST", ["api", "instant-actions"]) -> handleInstant st req respond
     ("POST", ["api", "save"])    -> handleSave st req respond
     ("POST", ["api", "reset"])   -> handleReset st req respond
 
@@ -301,13 +303,7 @@ handleDispatch st req respond = do
             ])
           (Just r, Just fleetCfg) -> do
             (fresh, _) <- refreshVocab st
-            let cfg = DispatchConfig
-                  { dcLoop = loopConfigWith st fresh Nothing
-                  , dcFleet = fleetCfg
-                  , dcRobot = r
-                  , dcAllowPublish = asDispatchAllow st
-                  , dcSeenOrders = asSeenOrders st
-                  }
+            let cfg = dispatchCfg st fresh r fleetCfg
             res <- dispatchOrder cfg dsl dryRun
             case res of
               Left errs -> json respond status200 (object
@@ -315,6 +311,49 @@ handleDispatch st req respond = do
               Right (answer, _) -> json respond status200 answer
       _ -> json respond status400
              (failValue "the request needs both dsl and robotId")
+
+-- | Send instant actions such as pause, resume or cancel.
+--
+-- No order plan is involved, but the robot check, dry-run default and
+-- @--allow-dispatch@ gate are the same as for a mission: a wrong topic is just
+-- as easy to send to with an instant action.
+handleInstant :: AppState -> Request -> Respond -> IO ResponseReceived
+handleInstant st req respond = do
+  body <- lazyRequestBody req
+  case Data.Aeson.eitherDecode body of
+    Left err -> json respond status400
+                  (failValue ("could not parse the request: " ++ err))
+    Right v -> case (field "robotId" v, fieldList "actions" v) of
+      (Just rid, Just actions) -> do
+        let dryRun = fromMaybe True (fieldBool "dryRun" v)
+        robot <- resolveRobot st (Just rid)
+        case (robot, asFleet st) of
+          (Nothing, _) -> json respond status200 (object
+            [ "ok" .= False
+            , "errors" .= ["robot " <> rid <> " is not in the fleet"]
+            ])
+          (Just _, Nothing) -> json respond status200 (object
+            [ "ok" .= False
+            , "errors" .= (["no fleet gateway is configured"] :: [Text])
+            ])
+          (Just r, Just fleetCfg) -> do
+            vocab <- readIORef (asVocab st)
+            res <- sendInstant (dispatchCfg st vocab r fleetCfg) actions dryRun
+            case res of
+              Left errs -> json respond status200 (object
+                [ "ok" .= False, "errors" .= errs ])
+              Right (answer, _) -> json respond status200 answer
+      _ -> json respond status400
+             (failValue "the request needs robotId and an actions array")
+
+dispatchCfg :: AppState -> Vocabulary -> RobotRef -> FleetConfig -> DispatchConfig
+dispatchCfg st vocab robot fleetCfg = DispatchConfig
+  { dcLoop = loopConfigWith st vocab Nothing
+  , dcFleet = fleetCfg
+  , dcRobot = robot
+  , dcAllowPublish = asDispatchAllow st
+  , dcSeenOrders = asSeenOrders st
+  }
 
 handleSave :: AppState -> Request -> Respond -> IO ResponseReceived
 handleSave st req respond = do

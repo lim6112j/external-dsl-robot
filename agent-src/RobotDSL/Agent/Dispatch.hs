@@ -13,6 +13,7 @@ module RobotDSL.Agent.Dispatch
   , DispatchConfig(..)
   , planOrder
   , dispatchOrder
+  , sendInstant
   , actionValueJSON
   , blockingTypeJSON
   ) where
@@ -100,33 +101,70 @@ dispatchOrder cfg src dryRun =
   case planOrder (lcVocab (dcLoop cfg)) (dcLoop cfg) (dcRobot cfg) src of
     Left errs -> pure (Left errs)
     Right outcome -> do
-      let mgr = lcManager (dcLoop cfg)
-          rid = rrRobotId (dcRobot cfg)
-      known <- fetchRobots mgr (dcFleet cfg)
-      case known of
-        Left e -> pure (Left ["could not check the selected robot: " <> T.pack e])
-        Right robots -> case find ((== rid) . rrRobotId) robots of
-          Nothing -> pure (Left ["robot " <> rid <> " is not in the fleet"])
-          Just r
-            | not (rrOnline r) ->
-                pure (Left ["robot " <> rid <> " is offline"])
-            | otherwise -> publishChecked mgr outcome rid
-  where
-    publishChecked mgr outcome rid = do
-      seen <- readIORef (dcSeenOrders cfg)
-      let oid = doOrderId outcome
-      if oid `elem` seen
-        then pure (Left ["duplicate orderId " <> oid
-                           <> " was already dispatched in this session"])
-        else if dryRun || not (dcAllowPublish cfg)
-          then pure (Right (dryResponse outcome, True))
-          else do
-            sent <- postJson mgr (dcFleet cfg) "/api/orders" (doRequest outcome)
-            case sent of
-              Left e -> pure (Left [T.pack e])
-              Right gatewayValue -> do
-                modifyIORef' (dcSeenOrders cfg) (++ [oid])
-                pure (Right (publishResponse outcome gatewayValue, False))
+      ok <- checkRobot cfg
+      case ok of
+        Left errs -> pure (Left errs)
+        Right () -> publishChecked cfg outcome dryRun
+
+-- | Pause, resume, cancel and friends. Unlike an order, an instant action
+-- bundle has no plan to validate: only the action types and the robot matter.
+sendInstant :: DispatchConfig -> [Text] -> Bool
+            -> IO (Either [Text] (Value, Bool))
+sendInstant cfg actions dryRun
+  | null actions =
+      pure (Left ["an instant action needs at least one action type"])
+  | otherwise = do
+      ok <- checkRobot cfg
+      case ok of
+        Left errs -> pure (Left errs)
+        Right () ->
+          let body = object
+                [ "actions" .= map (\a -> object ["actionType" .= a]) actions ]
+              mgr = lcManager (dcLoop cfg)
+              path = "/api/robots/" <> rrRobotId (dcRobot cfg)
+                       <> "/instant-actions"
+          in if dryRun || not (dcAllowPublish cfg)
+               then pure (Right (instantDryResponse body, True))
+               else do
+                 sent <- postJson mgr (dcFleet cfg) path body
+                 pure $ case sent of
+                   Left e -> Left [T.pack e]
+                   Right gw -> Right (instantPublishResponse body gw, False)
+
+-- | The gateway publishes to the given topic without checking that the robot
+-- exists. This is the check it does not make, and it applies to both orders
+-- and instant actions.
+checkRobot :: DispatchConfig -> IO (Either [Text] ())
+checkRobot cfg = do
+  let mgr = lcManager (dcLoop cfg)
+      rid = rrRobotId (dcRobot cfg)
+  known <- fetchRobots mgr (dcFleet cfg)
+  pure $ case known of
+    Left e -> Left ["could not check the selected robot: " <> T.pack e]
+    Right robots -> case find ((== rid) . rrRobotId) robots of
+      Nothing -> Left ["robot " <> rid <> " is not in the fleet"]
+      Just r
+        | not (rrOnline r) -> Left ["robot " <> rid <> " is offline"]
+        | otherwise -> Right ()
+
+publishChecked :: DispatchConfig -> DispatchOutcome -> Bool
+               -> IO (Either [Text] (Value, Bool))
+publishChecked cfg outcome dryRun = do
+  seen <- readIORef (dcSeenOrders cfg)
+  let oid = doOrderId outcome
+  if oid `elem` seen
+    then pure (Left ["duplicate orderId " <> oid
+                       <> " was already dispatched in this session"])
+    else if dryRun || not (dcAllowPublish cfg)
+      then pure (Right (dryResponse outcome, True))
+      else do
+        sent <- postJson (lcManager (dcLoop cfg)) (dcFleet cfg)
+                   "/api/orders" (doRequest outcome)
+        case sent of
+          Left e -> pure (Left [T.pack e])
+          Right gatewayValue -> do
+            modifyIORef' (dcSeenOrders cfg) (++ [oid])
+            pure (Right (publishResponse outcome gatewayValue, False))
 
 dryResponse :: DispatchOutcome -> Value
 dryResponse outcome = object
@@ -141,6 +179,21 @@ publishResponse outcome gatewayValue = object
   , "dryRun"   .= False
   , "request"  .= doRequest outcome
   , "gateway"  .= gatewayValue
+  ]
+
+instantDryResponse :: Value -> Value
+instantDryResponse body = object
+  [ "ok"      .= True
+  , "dryRun"  .= True
+  , "request" .= body
+  ]
+
+instantPublishResponse :: Value -> Value -> Value
+instantPublishResponse body gatewayValue = object
+  [ "ok"      .= True
+  , "dryRun"  .= False
+  , "request" .= body
+  , "gateway" .= gatewayValue
   ]
 
 -- | Nodes in travel order, with the segment's release flag. Edge steps are
