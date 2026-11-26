@@ -20,6 +20,82 @@ full `zoneType` vocabulary (`BLOCKED`, `LINE_GUIDED`, `RELEASE`,
 `COORDINATED_REPLANNING`, `SPEED_LIMIT`, `ACTION`, `PRIORITY`, `PENALTY`,
 `DIRECTED`, `BIDIRECTED`).
 
+## 임무 투입까지 (처음부터 끝까지)
+
+이제 **브라우저에서 DSL 생성·검증·투입까지** 할 수 있습니다. `저장` 버튼 옆의
+`실제 투입`을 누르면 게이트웨이에 보낼 요청을 먼저 보여주고, `확인 투입`을
+누를 때만 실제로 발행합니다. 흐름은 `게이트웨이 실행 → agent 실행 → DSL 생성
+→ 2단계 투입 → 실행 확인`입니다. `--allow-dispatch` 없이 실행하면 투입
+버튼이 비활성화됩니다.
+
+**1. 게이트웨이 실행** — `/Users/nixos/workspace/로봇관제시스템`에서:
+
+```bash
+docker run -d --name rcs-mosquitto -p 1883:1883 eclipse-mosquitto
+cargo run -p vda5050-sim -- --config deploy/sim.yaml &
+cargo run -p gateway -- --http-addr 127.0.0.1:8080
+
+# 확인: 둘 다 JSON이 나와야 합니다
+curl -s http://127.0.0.1:8080/api/map
+curl -s http://127.0.0.1:8080/api/robots    # "connection":"ONLINE" 로봇 필요
+```
+
+**2. agent 실행** — `--fleet`은 맵 파일이 아니라 게이트웨이 API를 읽습니다.
+`--allow-dispatch`가 없으면 항상 dry-run만 됩니다.
+
+```bash
+cd /Users/nixos/workspace/external-dsl-robot
+export OPENROUTER_API_KEY=...   # DSL 생성에 필요 (투입만 해도 시작 시 요구됨)
+cabal run robotdsl-agent -- --port 8790 \
+  --fleet http://127.0.0.1:8080 --allow-dispatch
+```
+
+게이트웨이에 `--api-token`을 걸었다면 `--gateway-token K`도 붙입니다.
+
+**3. DSL 생성** — http://127.0.0.1:8790 에서 로봇을 고르고 한국어로 지시하면
+DSL과 경로 미리보기가 나옵니다. 생성된 DSL을 `mission.robot`에 저장합니다.
+API로 바로 받을 수도 있습니다:
+
+```bash
+curl -s -X POST http://127.0.0.1:8790/api/command \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"랙에서 컨베이어로 팔레트 옮겨줘","robotId":"acme:AMR-001"}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["dsl"])' > mission.robot
+```
+
+**4. dry-run 확인** — 화면에서 온라인 로봇을 고르고 `실제 투입`을 누릅니다.
+이 단계에서는 게이트웨이에 쓰지 않고, 보낼 `OrderRequest`가 화면에 표시됩니다.
+`nodes` 순서, `released`, 액션을 확인하세요. DSL을 고치거나 로봇 선택을 바꾸면
+대기 중인 확인은 취소됩니다.
+
+**5. 실제 투입** — `확인 투입`을 누르면 `"dryRun":false`로 발행됩니다.
+상태에 `발행됨: <orderId>`가 보이면 게이트웨이가
+`vda5050/v3/acme/AMR-001/order`로 보낸 것입니다. `/api/robots`의
+`driving`·`orderId`와 `/api/events`에서 실행을 볼 수 있습니다.
+
+같은 작업을 API로 직접 하려면:
+
+```bash
+# dry-run (쓰지 않음)
+python3 -c 'import json; print(json.dumps({"dsl":open("mission.robot").read(),"robotId":"acme:AMR-001","dryRun":True}))' \
+  | curl -s -X POST http://127.0.0.1:8790/api/dispatch \
+      -H 'Content-Type: application/json' -d @- | python3 -m json.tool
+
+# 실제 발행
+python3 -c 'import json; print(json.dumps({"dsl":open("mission.robot").read(),"robotId":"acme:AMR-001","dryRun":False}))' \
+  | curl -s -X POST http://127.0.0.1:8790/api/dispatch \
+      -H 'Content-Type: application/json' -d @- | python3 -m json.tool
+```
+
+급한 정지는 `POST /api/instant-actions`에
+`{"robotId":"acme:AMR-001","actions":["cancelOrder"],"dryRun":false}`를 보냅니다.
+
+투입 전 거부 사유: zoneSet, 엣지 액션·제약, 맵에 없는 노드/홉, order 2개 이상,
+경로 없음, 선택 로봇과 DSL의 `robot` 불일치, 오프라인·미등록 로봇, 세션 내
+중복 `orderId`, DSL 안의 `instant` 블록(별도 instant-actions API로 보냄).
+`--fleet` 없이는 투입할 수 없습니다. API 상세는
+[Dispatching a mission](#dispatching-a-mission) 참조.
+
 > **처음 작성하시나요?** 단계별 작성 가이드:
 > [`docs/DSL-GUIDE.md`](docs/DSL-GUIDE.md) — 최소 파일에서 시작해 픽앤드롭,
 > 충전, 순찰, 속도 제한 존, 정지/재개/중단까지, 오류 메시지 해설 포함.
@@ -76,7 +152,7 @@ If you would rather *talk* your mission into existence, skip to
 
 ```bash
 cabal build          # library, CLI and the agent
-cabal test           # 140 tests
+cabal test           # 142 tests
 ```
 
 Requires GHC 9.10 (developed against 9.10.3) and cabal. The core DSL depends on
@@ -105,9 +181,10 @@ written to disk, and no mission is published, unless `RobotDSL.Parser` and
 `RobotDSL.Validate` both accept the output. When they reject it, the exact
 error is fed back for another attempt, up to three times.
 
-Publishing is a separate, explicit step: `/api/dispatch` dry-runs by default,
-and even a request with `"dryRun":false` only publishes when the agent was
-started with `--allow-dispatch`.
+Publishing is a separate, explicit step: the UI's `실제 투입` button dry-runs
+first and publishes only after `확인 투입`; `/api/dispatch` likewise dry-runs
+by default, and even a request with `"dryRun":false` only publishes when the
+agent was started with `--allow-dispatch`.
 
 ```bash
 # build the voice helper once (macOS Speech framework, on-device)
@@ -473,7 +550,7 @@ live in `Validate.hs` and run first.
 cabal test
 ```
 
-140 tests across groups for parsing (including that `speed` and `speed_limit`
+142 tests across groups for parsing (including that `speed` and `speed_limit`
 do not collide, and that every `zoneType` parses), emitting (sequenceId parity,
 actionId uniqueness and stability, headerId allocation, `mapId` inheritance,
 the `priorityFactor` key), schema validation (every example round-trips
@@ -498,6 +575,7 @@ npx playwright install chromium   # once; downloads the browser
 
 cabal run robotdsl-agent -- --port 8790 --fleet http://127.0.0.1:8080
 node tools/browser-test.js
+node tools/browser-test-dispatch.js   # dispatch button; intercepts all writes
 
 # Dispatch tests use an in-process gateway stub; no broker or robot is needed.
 # To publish for real, start the agent with --fleet and --allow-dispatch.
